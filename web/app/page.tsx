@@ -133,6 +133,53 @@ function StatChip({ icon, label, value, color }: { icon: string; label: string; 
 }
 
 /* ------------------------------------------------------------------ */
+/*  RetroButton — 3-D press + flash feedback + hotkey badge             */
+/* ------------------------------------------------------------------ */
+function RetroButton({
+  children,
+  onClick,
+  disabled = false,
+  className = "",
+  hotkey,
+  type = "button",
+  style,
+}: {
+  children: React.ReactNode;
+  onClick?: () => void;
+  disabled?: boolean;
+  className?: string;
+  hotkey?: string;
+  type?: "button" | "submit";
+  style?: React.CSSProperties;
+}) {
+  const [flashing, setFlashing] = useState(false);
+
+  function handleClick() {
+    if (disabled) return;
+    if (!flashing) {
+      setFlashing(true);
+      setTimeout(() => setFlashing(false), 320);
+    }
+    onClick?.();
+  }
+
+  return (
+    <button
+      type={type}
+      disabled={disabled}
+      onClick={handleClick}
+      style={style}
+      className={`btn ${className} ${flashing ? "btn-flashing" : ""}`}
+    >
+      {children}
+      {hotkey && (
+        <span className="btn-hotkey">[{hotkey}]</span>
+      )}
+    </button>
+  );
+}
+
+/* ------------------------------------------------------------------ */
 /*  Login Screen                                                        */
 /* ------------------------------------------------------------------ */
 function LoginScreen({ onLogin }: { onLogin: (username: string) => void }) {
@@ -160,9 +207,12 @@ function LoginScreen({ onLogin }: { onLogin: (username: string) => void }) {
     <div className="crt min-h-screen flex items-center justify-center bg-[#0a0c10]">
       <div className="panel p-10 w-full max-w-md text-center space-y-8">
         <div>
-          <p className="font-mono text-xs text-green-800 tracking-[0.4em] uppercase mb-3">— System Boot v2.6 —</p>
-          <h1 className="font-mono text-5xl font-black glow-green text-green-400 tracking-tight">ARCADIA</h1>
-          <p className="font-mono text-xs text-green-700 mt-1">C-Powered Browser RPG</p>
+          <p className="font-mono text-xs text-green-800 tracking-[0.4em] uppercase mb-3 text-flicker">— System Boot v2.6 —</p>
+          <h1 className="font-mono text-5xl font-black text-green-400 tracking-tight">
+            <span className="glitch-text">ARCADIA</span>
+          </h1>
+          <p className="font-mono text-xs text-green-700 mt-2">C-Powered Browser RPG</p>
+          <p className="font-mono text-[10px] text-green-900 mt-1 text-flicker tracking-widest uppercase">▸ System Ready ◂</p>
         </div>
 
         <form onSubmit={handleSubmit} className="space-y-4 text-left">
@@ -184,10 +234,10 @@ function LoginScreen({ onLogin }: { onLogin: (username: string) => void }) {
 
           {err && <p className="font-mono text-xs text-red-400 glow-red">✗ {err}</p>}
 
-          <button type="submit" disabled={loading} className="btn btn-green w-full py-3 text-sm">
+          <RetroButton type="submit" disabled={loading} className="btn-green w-full py-3 text-sm">
             {loading ? <Spinner /> : null}
             {loading ? "  Entering Arcadia…" : "Enter the World ▶"}
-          </button>
+          </RetroButton>
         </form>
 
         <p className="font-mono text-[10px] text-green-900">
@@ -206,6 +256,7 @@ export default function ArcadiaGame() {
   const [gs, setGs] = useState<GameState | null>(null);
   const [busy, setBusy] = useState(false);
   const [lastError, setLastError] = useState<string | null>(null);
+  const [screenFlash, setScreenFlash] = useState(false);
   const logRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -226,6 +277,30 @@ export default function ArcadiaGame() {
     },
     [username, busy]
   );
+
+  function triggerFlash() {
+    setScreenFlash(true);
+    setTimeout(() => setScreenFlash(false), 500);
+  }
+
+  /* Keyboard shortcuts */
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (!gs || busy) return;
+      const tag = (e.target as HTMLElement).tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA") return;
+      const k = e.key.toLowerCase();
+      if (k === "c")                             { dispatch("combat"); triggerFlash(); }
+      else if (k === "b")                        { dispatch("buy"); }
+      else if (k === "r")                        { dispatch("skill", ["rotate"]); }
+      else if (k === "arrowup"    || k === "w")  { if (gs.exits.includes("N")) dispatch("move", ["N"]); }
+      else if (k === "arrowdown"  || k === "s")  { if (gs.exits.includes("S")) dispatch("move", ["S"]); }
+      else if (k === "arrowright" || k === "d")  { if (gs.exits.includes("E")) dispatch("move", ["E"]); }
+      else if (k === "arrowleft"  || k === "a")  { if (gs.exits.includes("W")) dispatch("move", ["W"]); }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [gs, busy, dispatch]);
 
   function handleLogin(name: string) {
     setUsername(name);
@@ -251,6 +326,7 @@ export default function ArcadiaGame() {
 
   return (
     <div className="crt min-h-screen bg-[#0a0c10] flex flex-col font-mono select-none">
+      {screenFlash && <div className="screen-flash" />}
 
       {/* ── TOP STATUS BAR ──────────────────────────────────────────── */}
       <header className="sticky top-0 z-10 border-b border-green-950 bg-[#050a05]/95 backdrop-blur px-4 py-2">
@@ -301,17 +377,19 @@ export default function ArcadiaGame() {
             >
               {(["N","E","S","W"] as const).map((dir) => {
                 const areaMap: Record<string,string> = { N:"n", S:"s", E:"e", W:"w" };
+                const keyHint: Record<string,string> = { N:"W", S:"S", E:"D", W:"A" };
                 const avail = exits.includes(dir);
                 return (
-                  <button
+                  <RetroButton
                     key={dir}
                     style={{ gridArea: areaMap[dir] }}
                     disabled={!avail || busy}
                     onClick={() => dispatch("move", [dir])}
-                    className={`btn text-xs py-1.5 px-2 ${avail ? "btn-cyan" : "btn-ghost opacity-25"}`}
+                    className={`btn-compass text-xs py-1.5 px-2 ${avail ? "btn-cyan" : "btn-ghost opacity-25"}`}
+                    hotkey={avail ? keyHint[dir] : undefined}
                   >
                     {dir}
-                  </button>
+                  </RetroButton>
                 );
               })}
               <div style={{ gridArea: "2 / 2 / 3 / 3" }}
@@ -353,13 +431,14 @@ export default function ArcadiaGame() {
                 </li>
               ))}
             </ul>
-            <button
+            <RetroButton
               disabled={busy || skills.length === 0}
               onClick={() => dispatch("skill", ["rotate"])}
-              className="btn btn-cyan w-full text-[11px] py-1.5"
+              className="btn-cyan w-full text-[11px] py-1.5"
+              hotkey="R"
             >
               ↻ Rotate Active Skill
-            </button>
+            </RetroButton>
           </div>
         </div>
 
@@ -406,41 +485,49 @@ export default function ArcadiaGame() {
           <div className="panel p-4">
             <PanelHeader label="Actions" color="green" />
             <div className="grid grid-cols-2 gap-2">
-              <button
+              <RetroButton
                 disabled={busy}
-                onClick={() => dispatch("combat")}
-                className="btn btn-red col-span-2 py-3 text-sm"
+                onClick={() => { dispatch("combat"); triggerFlash(); }}
+                className="btn-red col-span-2 py-3 text-sm"
+                hotkey="C"
               >
                 {busy ? <Spinner /> : "⚔"}
                 {busy ? "  Simulating…" : "  Engage Combat"}
-              </button>
+              </RetroButton>
 
-              <button
+              <RetroButton
                 disabled={busy || shop.length === 0}
                 onClick={() => dispatch("buy")}
-                className="btn btn-amber"
+                className="btn-amber"
+                hotkey="B"
               >
                 🛒&nbsp;Buy Best Item
-              </button>
+              </RetroButton>
 
-              <button
+              <RetroButton
                 disabled={busy || skills.length === 0}
                 onClick={() => dispatch("skill", ["rotate"])}
-                className="btn btn-cyan"
+                className="btn-cyan"
+                hotkey="R"
               >
                 ↻&nbsp;Rotate Skill
-              </button>
+              </RetroButton>
 
-              {(["N","S","E","W"] as const).map((dir) => (
-                <button
-                  key={dir}
-                  disabled={busy || !exits.includes(dir)}
-                  onClick={() => dispatch("move", [dir])}
-                  className={`btn ${exits.includes(dir) ? "btn-green" : "btn-ghost"}`}
-                >
-                  Move {dir}
-                </button>
-              ))}
+              {(["N","S","E","W"] as const).map((dir) => {
+                const keyHint: Record<string,string> = { N:"W", S:"S", E:"D", W:"A" };
+                const avail = exits.includes(dir);
+                return (
+                  <RetroButton
+                    key={dir}
+                    disabled={busy || !avail}
+                    onClick={() => dispatch("move", [dir])}
+                    className={avail ? "btn-green" : "btn-ghost"}
+                    hotkey={avail ? keyHint[dir] : undefined}
+                  >
+                    Move {dir}
+                  </RetroButton>
+                );
+              })}
             </div>
 
             {/* HP summary */}
@@ -528,12 +615,12 @@ export default function ArcadiaGame() {
           </div>
 
           {/* Logout */}
-          <button
+          <RetroButton
             onClick={() => { setUsername(null); setGs(null); setLastError(null); }}
-            className="btn btn-ghost w-full text-[11px]"
+            className="btn-ghost w-full text-[11px]"
           >
             ← Logout
-          </button>
+          </RetroButton>
         </div>
       </main>
 
