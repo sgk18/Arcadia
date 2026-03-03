@@ -16,6 +16,123 @@ const PL_SPD = 3.6;
 const EN_SPD = 0.75;
 
 /* ═══════════════════════════════════════════════════════════════════════
+   SPRITE SYSTEM
+═══════════════════════════════════════════════════════════════════════ */
+type AnimKey = 'idle' | 'walk' | 'slash' | 'dying' | 'hurt';
+type SpriteChar = 'valkyrie' | 'goblin' | 'orc' | 'ogre';
+
+interface SpriteSet {
+  idle:  HTMLImageElement[];
+  walk:  HTMLImageElement[];
+  slash: HTMLImageElement[];
+  dying: HTMLImageElement[];
+  hurt:  HTMLImageElement[];
+}
+
+type SpriteDB = Record<SpriteChar, SpriteSet>;
+
+const SPRITE_DEFS: Record<SpriteChar, Record<AnimKey, { name: string; count: number; start?: number }>> = {
+  valkyrie: {
+    idle:  { name: 'Valkyrie_Idle',     count: 18 },
+    walk:  { name: 'Valkyrie_Walking',  count: 24 },
+    slash: { name: 'Valkyrie_Slashing', count: 12 },
+    dying: { name: 'Valkyrie_Dying',    count: 15 },
+    hurt:  { name: 'Valkyrie_Hurt',     count: 12 },
+  },
+  goblin: {
+    idle:  { name: 'Goblin_Idle',     count: 12, start: 6 },
+    walk:  { name: 'Goblin_Walking',  count: 24 },
+    slash: { name: 'Goblin_Slashing', count: 12 },
+    dying: { name: 'Goblin_Slashing', count: 12 },  // reuse slash
+    hurt:  { name: 'Goblin_Idle',     count: 12, start: 6 },
+  },
+  orc: {
+    idle:  { name: 'Orc_Idle',     count: 18 },
+    walk:  { name: 'Orc_Walking',  count: 24 },
+    slash: { name: 'Orc_Slashing', count: 12 },
+    dying: { name: 'Orc_Dying',    count: 15 },
+    hurt:  { name: 'Orc_Hurt',     count: 12 },
+  },
+  ogre: {
+    idle:  { name: 'Ogre_Idle',     count: 18 },
+    walk:  { name: 'Ogre_Walking',  count: 24 },
+    slash: { name: 'Ogre_Slashing', count: 12 },
+    dying: { name: 'Ogre_Dying',    count: 15 },
+    hurt:  { name: 'Ogre_Hurt',     count: 12 },
+  },
+};
+
+const SPRITE_DIRS: Record<SpriteChar, Record<AnimKey, string>> = {
+  valkyrie: { idle: 'idle', walk: 'walk', slash: 'slash', dying: 'dying', hurt: 'hurt' },
+  goblin:   { idle: 'idle', walk: 'walk', slash: 'slash', dying: 'slash', hurt: 'idle' },
+  orc:      { idle: 'idle', walk: 'walk', slash: 'slash', dying: 'dying', hurt: 'hurt' },
+  ogre:     { idle: 'idle', walk: 'walk', slash: 'slash', dying: 'dying', hurt: 'hurt' },
+};
+
+function loadSpriteSet(char: SpriteChar): SpriteSet {
+  const result = {} as SpriteSet;
+  for (const animKey of ['idle','walk','slash','dying','hurt'] as AnimKey[]) {
+    const def = SPRITE_DEFS[char][animKey];
+    const dir = SPRITE_DIRS[char][animKey];
+    const frames: HTMLImageElement[] = [];
+    const start = def.start ?? 0;
+    for (let i = 0; i < def.count; i++) {
+      const img = new Image();
+      const num = String(start + i).padStart(3, '0');
+      img.src = `/sprites/${char}/${dir}/0_${def.name}_${num}.png`;
+      frames.push(img);
+    }
+    result[animKey] = frames;
+  }
+  return result;
+}
+
+function loadAllSprites(): SpriteDB {
+  return {
+    valkyrie: loadSpriteSet('valkyrie'),
+    goblin:   loadSpriteSet('goblin'),
+    orc:      loadSpriteSet('orc'),
+    ogre:     loadSpriteSet('ogre'),
+  };
+}
+
+const ANIM_SPEED: Record<AnimKey, number> = {
+  idle:  5,   // ticks per frame
+  walk:  3,
+  slash: 2,
+  dying: 3,
+  hurt:  3,
+};
+
+const SPRITE_TYPES: SpriteChar[] = ['goblin', 'orc', 'ogre'];
+
+const PL_SPRITE_SIZE = 80;  // pixels on canvas
+const EN_SPRITE_SIZE = 72;
+
+function drawSprite(
+  ctx: CanvasRenderingContext2D,
+  frames: HTMLImageElement[],
+  frameIdx: number,
+  cx: number, cy: number,
+  size: number,
+  facingLeft: boolean,
+): boolean {
+  if (!frames.length) return false;
+  const img = frames[Math.abs(frameIdx) % frames.length];
+  if (!img || !img.complete || img.naturalWidth === 0) return false;
+  ctx.save();
+  if (facingLeft) {
+    ctx.translate(cx, cy);
+    ctx.scale(-1, 1);
+    ctx.drawImage(img, -size / 2, -size / 2, size, size);
+  } else {
+    ctx.drawImage(img, cx - size / 2, cy - size / 2, size, size);
+  }
+  ctx.restore();
+  return true;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
    TILE SYSTEM
 ═══════════════════════════════════════════════════════════════════════ */
 const FLOOR = 0, WALL = 1, DN = 2, DS = 3, DE = 4, DW = 5;
@@ -180,6 +297,11 @@ const SHOP_SPAWNS: [number, number, number][] = [
 interface Enemy {
   id: number; x: number; y: number; vx: number; vy: number;
   name: string; col: string; alive: boolean; wanderTimer: number;
+  spriteType: SpriteChar;
+  anim: AnimKey;
+  animFrame: number;
+  animTimer: number;
+  facingLeft: boolean;
 }
 
 interface ShopNpc { x: number; y: number; }
@@ -242,6 +364,11 @@ function spawnEnemies(roomId: number): Enemy[] {
     name: d.name, col: d.col,
     alive: true,
     wanderTimer: 60 + Math.random() * 120,
+    spriteType: SPRITE_TYPES[i % SPRITE_TYPES.length],
+    anim: 'idle' as AnimKey,
+    animFrame: Math.floor(Math.random() * 18),
+    animTimer: 0,
+    facingLeft: Math.random() < 0.5,
   }));
 }
 
@@ -323,7 +450,18 @@ function drawGlowCircle(
   }
 }
 
-function drawPlayer(ctx: CanvasRenderingContext2D, x: number, y: number, th: typeof THEMES[0]) {
+function drawPlayer(
+  ctx: CanvasRenderingContext2D, x: number, y: number,
+  th: typeof THEMES[0],
+  sprites: SpriteDB | null,
+  anim: AnimKey, frame: number, facingLeft: boolean,
+) {
+  if (sprites) {
+    const frames = sprites.valkyrie[anim];
+    const drawn = drawSprite(ctx, frames, frame, x, y, PL_SPRITE_SIZE, facingLeft);
+    if (drawn) return;
+  }
+  /* fallback glowing circle */
   drawGlowCircle(ctx, x, y, PL_R, '#3b82f6', th.glow);
   ctx.fillStyle = '#fff';
   ctx.beginPath();
@@ -691,6 +829,12 @@ function ArcadiaGame({ initialGs, username }: { initialGs: ApiResult; username: 
     frame:    0,
     animId:   0,
     apiState: initialGs._state,
+    /* sprite state */
+    sprites:    null as SpriteDB | null,
+    plAnim:     'idle' as AnimKey,
+    plFrame:    0,
+    plTimer:    0,
+    plFacing:   false,   // false = right
   });
 
   /* react state driving HUD + overlays */
@@ -773,6 +917,11 @@ function ArcadiaGame({ initialGs, username }: { initialGs: ApiResult; username: 
     window.location.reload();
   }, [username]);
 
+  /* ── load sprites ── */
+  useEffect(() => {
+    W.current.sprites = loadAllSprites();
+  }, []);
+
   /* ════════════════════════════════ GAME LOOP ════════════════════════════ */
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -834,6 +983,18 @@ function ArcadiaGame({ initialGs, username }: { initialGs: ApiResult; username: 
         w.px = Math.max(PL_R, Math.min(CW - PL_R, w.px));
         w.py = Math.max(PL_R, Math.min(CH - PL_R, w.py));
 
+        /* player animation */
+        const moving = dx !== 0 || dy !== 0;
+        w.plAnim = moving ? 'walk' : 'idle';
+        if (dx < 0) w.plFacing = true;
+        if (dx > 0) w.plFacing = false;
+        w.plTimer++;
+        if (w.plTimer >= ANIM_SPEED[w.plAnim]) {
+          w.plTimer = 0;
+          const plFrameCount = w.sprites?.valkyrie?.[w.plAnim]?.length ?? 18;
+          w.plFrame = (w.plFrame + 1) % plFrameCount;
+        }
+
         /* door transition */
         const pt = tileAt(map, w.px, w.py);
         if (isDoorTile(pt) && w.cooldown === 0) {
@@ -869,6 +1030,18 @@ function ArcadiaGame({ initialGs, username }: { initialGs: ApiResult; username: 
           en.x = Math.max(TILE + EN_R, Math.min(CW - TILE - EN_R, en.x));
           en.y = Math.max(TILE + EN_R, Math.min(CH - TILE - EN_R, en.y));
 
+          /* enemy animation */
+          const enMoving = Math.abs(en.vx) > 0.01 || Math.abs(en.vy) > 0.01;
+          en.anim = enMoving ? 'walk' : 'idle';
+          if (en.vx < -0.01) en.facingLeft = true;
+          if (en.vx >  0.01) en.facingLeft = false;
+          en.animTimer++;
+          if (en.animTimer >= ANIM_SPEED[en.anim]) {
+            en.animTimer = 0;
+            const frameCount = w.sprites?.[en.spriteType]?.[en.anim]?.length ?? 18;
+            en.animFrame = (en.animFrame + 1) % frameCount;
+          }
+
           /* player vs enemy */
           if (w.cooldown === 0 && dist2d(w.px, w.py, en.x, en.y) < PL_R + EN_R + 2) {
             w.cooldown = 120;
@@ -887,16 +1060,29 @@ function ArcadiaGame({ initialGs, username }: { initialGs: ApiResult; username: 
       /* enemies */
       for (const en of w.enemies) {
         if (!en.alive) continue;
-        drawGlowCircle(ctx, en.x, en.y, EN_R, en.col, en.col, en.name);
-        /* eye */
-        ctx.fillStyle = '#fff';
-        ctx.beginPath(); ctx.arc(en.x, en.y - 4, 3, 0, Math.PI * 2); ctx.fill();
-        ctx.fillStyle = '#000';
-        ctx.beginPath(); ctx.arc(en.x, en.y - 4, 1.5, 0, Math.PI * 2); ctx.fill();
+        let spriteDrawn = false;
+        if (w.sprites) {
+          const frames = w.sprites[en.spriteType][en.anim];
+          spriteDrawn = drawSprite(ctx, frames, en.animFrame, en.x, en.y, EN_SPRITE_SIZE, en.facingLeft);
+        }
+        if (!spriteDrawn) {
+          drawGlowCircle(ctx, en.x, en.y, EN_R, en.col, en.col, en.name);
+          ctx.fillStyle = '#fff';
+          ctx.beginPath(); ctx.arc(en.x, en.y - 4, 3, 0, Math.PI * 2); ctx.fill();
+          ctx.fillStyle = '#000';
+          ctx.beginPath(); ctx.arc(en.x, en.y - 4, 1.5, 0, Math.PI * 2); ctx.fill();
+        } else {
+          /* name label above sprite */
+          ctx.fillStyle = en.col;
+          ctx.font = '9px ui-monospace,monospace';
+          ctx.textAlign = 'center';
+          ctx.fillText(en.name, en.x, en.y - EN_SPRITE_SIZE / 2 - 4);
+          ctx.textAlign = 'left';
+        }
       }
 
       /* player */
-      drawPlayer(ctx, w.px, w.py, th);
+      drawPlayer(ctx, w.px, w.py, th, w.sprites, w.plAnim, w.plFrame, w.plFacing);
 
       /* room name watermark */
       ctx.save();
