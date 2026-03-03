@@ -64,11 +64,11 @@ const ROOM_MAPS: TT[][][] = [
     '#..####........#...#',
     '#..#...........#...#',
     '#..................#',
-    '#....###...###.....EE',
-    '#..................EE',
+    '#....###...###....EE',
+    '#.................EE',
     '#....###...###.....#',
     '#..................#',
-    '#..#...........####.#',
+    '#..#..........####.#',
     '#..#...............#',
     '#..................#',
     '##########SS########',
@@ -126,19 +126,19 @@ interface DoorExit { dir: string; tile: TT; destRoom: number; spawnX: number; sp
 
 const ROOM_EXITS: DoorExit[][] = [
   /* 0 */ [
-    { dir: 'N', tile: DN, destRoom: 1, spawnX: 9.5 * TILE, spawnY: 10.5 * TILE },
-    { dir: 'E', tile: DE, destRoom: 2, spawnX:  1.5 * TILE, spawnY:  6.5 * TILE },
+    { dir: 'N', tile: DN, destRoom: 1, spawnX: 9.5 * TILE, spawnY: 9.5 * TILE },   /* enter Armory, spawn 3 tiles from S door */
+    { dir: 'E', tile: DE, destRoom: 2, spawnX: 3.5 * TILE, spawnY: 6.5 * TILE },   /* enter Library, spawn 3 tiles from W door */
   ],
   /* 1 */ [
-    { dir: 'S', tile: DS, destRoom: 0, spawnX: 9.5 * TILE, spawnY:  1.5 * TILE },
-    { dir: 'E', tile: DE, destRoom: 2, spawnX:  1.5 * TILE, spawnY:  6.5 * TILE },
+    { dir: 'S', tile: DS, destRoom: 0, spawnX: 9.5 * TILE, spawnY: 3.5 * TILE },   /* enter Entrance, spawn 3 tiles from N door */
+    { dir: 'E', tile: DE, destRoom: 2, spawnX: 3.5 * TILE, spawnY: 6.5 * TILE },   /* enter Library, spawn 3 tiles from W door */
   ],
   /* 2 */ [
-    { dir: 'W', tile: DW, destRoom: 1, spawnX: 18.5 * TILE, spawnY:  6.5 * TILE },
-    { dir: 'N', tile: DN, destRoom: 3, spawnX:  9.5 * TILE, spawnY: 10.5 * TILE },
+    { dir: 'W', tile: DW, destRoom: 1, spawnX: 16.5 * TILE, spawnY: 6.5 * TILE },  /* enter Armory, spawn 3 tiles from E door */
+    { dir: 'N', tile: DN, destRoom: 3, spawnX:  9.5 * TILE, spawnY: 9.5 * TILE },  /* enter Sanctum, spawn 3 tiles from S door */
   ],
   /* 3 */ [
-    { dir: 'S', tile: DS, destRoom: 2, spawnX:  9.5 * TILE, spawnY:  1.5 * TILE },
+    { dir: 'S', tile: DS, destRoom: 2, spawnX: 9.5 * TILE, spawnY: 3.5 * TILE },   /* enter Library, spawn 3 tiles from N door */
   ],
 ];
 
@@ -655,8 +655,28 @@ function MapOverlay({ current, onClose }: { current: number; onClose: () => void
 /* ═══════════════════════════════════════════════════════════════════════
    MAIN GAME CANVAS COMPONENT
 ═══════════════════════════════════════════════════════════════════════ */
+/* ─── Touch D-Pad ─── */
+const DPAD_BTNS = [
+  { label: '↑', dx: 0,  dy: -1, style: { top: '0%',   left: '33%'  } },
+  { label: '↓', dx: 0,  dy:  1, style: { top: '66%',  left: '33%'  } },
+  { label: '←', dx: -1, dy:  0, style: { top: '33%',  left: '0%'   } },
+  { label: '→', dx: 1,  dy:  0, style: { top: '33%',  left: '66%'  } },
+] as const;
+
 function ArcadiaGame({ initialGs, username }: { initialGs: ApiResult; username: string }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
+
+  /* responsive scale */
+  const [scale, setScale] = useState(1);
+  useEffect(() => {
+    function update() {
+      const s = Math.min(1, (window.innerWidth - 16) / CW, (window.innerHeight - 16) / CH);
+      setScale(parseFloat(s.toFixed(3)));
+    }
+    update();
+    window.addEventListener('resize', update);
+    return () => window.removeEventListener('resize', update);
+  }, []);
 
   /* mutable world (game-loop owned, never trigger re-render) */
   const W = useRef({
@@ -679,6 +699,7 @@ function ArcadiaGame({ initialGs, username }: { initialGs: ApiResult; username: 
   const [fightName, setFightName] = useState('');
   const [busy,      setBusy]      = useState(false);
   const [shopTxt,   setShopTxt]   = useState('');
+  const [defeated,  setDefeated]  = useState(false); /* shows "you fell" toast */
 
   /* keep overlay ref in sync so game loop can read it without stale closure */
   const overlayRef = useRef<Overlay>('none');
@@ -692,35 +713,42 @@ function ArcadiaGame({ initialGs, username }: { initialGs: ApiResult; username: 
     setBusy(true);
     const res = await callApi('combat', W.current.apiState);
     W.current.apiState = res._state;
+    localStorage.setItem(`arcadia_${username}`, JSON.stringify(res));
     setGs(res);
     setBusy(false);
 
-    if (res.player.hp <= 0) { setOverlay('none'); return; }
-
     const last = res.events[res.events.length - 1] ?? '';
-    if (/defeat|fled|victory/i.test(last)) {
-      /* mark this enemy as dead in the world */
+    /* combat ends on victory, defeat/revived, or flee — engine auto-revives so hp never hits 0 */
+    if (/victory|defeat|revived|fled/i.test(last)) {
       const en = W.current.enemies.find(e => e.alive && e.name === fightName);
-      if (en) en.alive = false;
+      if (en && /victory/i.test(last)) en.alive = false;
+      if (/revived/i.test(last)) setDefeated(true);  /* show defeat toast */
       setOverlay('none');
       W.current.cooldown = 90;
     }
-  }, [fightName]);
+  }, [fightName, username]);
 
-  const handleFlee = useCallback(() => {
+  const handleFlee = useCallback(async () => {
+    setBusy(true);
+    const res = await callApi('combat', W.current.apiState, ['flee']);
+    W.current.apiState = res._state;
+    localStorage.setItem(`arcadia_${username}`, JSON.stringify(res));
+    setGs(res);
+    setBusy(false);
     setOverlay('none');
     W.current.cooldown = 180;
-  }, []);
+  }, [username]);
 
   /* ── shop ── */
   const handleBuy = useCallback(async () => {
     setBusy(true);
     const res = await callApi('buy', W.current.apiState);
     W.current.apiState = res._state;
+    localStorage.setItem(`arcadia_${username}`, JSON.stringify(res));
     setGs(res);
     setShopTxt(res.events[res.events.length - 1] ?? '');
     setBusy(false);
-  }, []);
+  }, [username]);
 
   /* ── room travel ── */
   const doTravel = useCallback(async (dir: string, dest: number, sx: number, sy: number) => {
@@ -728,6 +756,7 @@ function ArcadiaGame({ initialGs, username }: { initialGs: ApiResult; username: 
     W.current.paused = true;
     const res = await callApi('move', W.current.apiState, [dir]);
     W.current.apiState = res._state;
+    localStorage.setItem(`arcadia_${username}`, JSON.stringify(res));
     W.current.roomId   = dest;
     W.current.px       = sx;
     W.current.py       = sy;
@@ -736,7 +765,7 @@ function ArcadiaGame({ initialGs, username }: { initialGs: ApiResult; username: 
     W.current.cooldown = 90;
     setGs(res);
     W.current.paused = overlayRef.current !== 'none';
-  }, []);
+  }, [username]);
 
   /* ── logout ── */
   const handleLogout = useCallback(() => {
@@ -790,19 +819,14 @@ function ArcadiaGame({ initialGs, username }: { initialGs: ApiResult; username: 
 
         if (dx !== 0) {
           const tx = w.px + dx + (dx > 0 ? cr : -cr);
-          if (!isDoorTile(tileAt(map, tx, w.py - cr)) && tileAt(map, tx, w.py - cr) !== WALL &&
-              !isDoorTile(tileAt(map, tx, w.py + cr)) && tileAt(map, tx, w.py + cr) !== WALL) {
+          /* only WALL blocks — door tiles are always passable */
+          if (tileAt(map, tx, w.py - cr) !== WALL && tileAt(map, tx, w.py + cr) !== WALL) {
             w.px += dx;
-          } else if (isDoorTile(tileAt(map, tx, w.py))) {
-            w.px += dx;  /* allow walking into door tiles */
           }
         }
         if (dy !== 0) {
           const ty = w.py + dy + (dy > 0 ? cr : -cr);
-          if (!isDoorTile(tileAt(map, w.px - cr, ty)) && tileAt(map, w.px - cr, ty) !== WALL &&
-              !isDoorTile(tileAt(map, w.px + cr, ty)) && tileAt(map, w.px + cr, ty) !== WALL) {
-            w.py += dy;
-          } else if (isDoorTile(tileAt(map, w.px, ty))) {
+          if (tileAt(map, w.px - cr, ty) !== WALL && tileAt(map, w.px + cr, ty) !== WALL) {
             w.py += dy;
           }
         }
@@ -891,16 +915,25 @@ function ArcadiaGame({ initialGs, username }: { initialGs: ApiResult; username: 
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  const dead = gs.player.hp <= 0;
+  const activeSkill = gs.skills.find(s => s.active);
 
   return (
     <div className="min-h-screen flex items-center justify-center" style={{ background: '#000' }}>
-      <div className="relative shadow-2xl" style={{ width: CW, height: CH }}>
-        <canvas ref={canvasRef} width={CW} height={CH} className="block"
-                style={{ imageRendering: 'pixelated' }} />
+      <div style={{
+        width: CW * scale, height: CH * scale,
+        position: 'relative',
+      }}>
+        {/* scale wrapper */}
+        <div style={{
+          width: CW, height: CH,
+          transform: `scale(${scale})`,
+          transformOrigin: 'top left',
+          position: 'relative',
+        }}>
+          <canvas ref={canvasRef} width={CW} height={CH} className="block"
+                  style={{ imageRendering: 'pixelated' }} />
 
-        {/* HUD */}
-        {!dead && (
+          {/* HUD */}
           <Hud
             player={gs.player}
             roomName={THEMES[W.current.roomId]?.name ?? gs.location}
@@ -909,45 +942,102 @@ function ArcadiaGame({ initialGs, username }: { initialGs: ApiResult; username: 
             onMap={() => setOverlay('map')}
             onLogout={handleLogout}
           />
-        )}
 
-        {/* GAME OVER */}
-        {dead && (
-          <div className="absolute inset-0 flex flex-col items-center justify-center z-50"
-               style={{ background: 'rgba(0,0,0,0.92)', fontFamily: 'ui-monospace,monospace' }}>
-            <p className="text-[10px] tracking-widest text-[#ef4444] uppercase mb-3">Connection Lost</p>
-            <h2 className="text-4xl font-black text-white mb-2">YOU FELL</h2>
-            <p className="text-[#475569] text-sm mb-8">{gs.player.username} has been defeated.</p>
-            <button onClick={handleLogout}
-                    className="px-8 py-3 rounded-lg font-bold tracking-widest uppercase text-white text-sm"
-                    style={{ background: '#dc2626', cursor: 'pointer' }}>
-              Restart
+          {/* DEFEAT TOAST — fades after 4s */}
+          {defeated && (
+            <div className="absolute top-12 left-1/2 -translate-x-1/2 z-50 px-5 py-3 rounded-xl text-center"
+                 style={{ background: 'rgba(220,38,38,0.95)', fontFamily: 'ui-monospace,monospace',
+                          border: '1px solid #f87171' }}>
+              <p className="text-white font-bold text-sm tracking-widest uppercase">YOU FELL</p>
+              <p className="text-[#fca5a5] text-[10px] mt-0.5">Revived at half HP</p>
+              <button onClick={() => setDefeated(false)}
+                      className="absolute top-1 right-2 text-[#fca5a5] text-xs hover:text-white">✕</button>
+            </div>
+          )}
+
+          {/* COMBAT */}
+          {overlay === 'combat' && (
+            <CombatOverlay
+              enemyName={fightName} player={gs.player}
+              events={gs.events} busy={busy}
+              onAttack={handleAttack} onFlee={handleFlee}
+            />
+          )}
+
+          {/* SHOP */}
+          {overlay === 'shop' && (
+            <ShopOverlay
+              shop={gs.shop} player={gs.player}
+              busy={busy} lastEvent={shopTxt}
+              onBuy={handleBuy} onClose={() => setOverlay('none')}
+            />
+          )}
+
+          {/* MAP */}
+          {overlay === 'map' && (
+            <MapOverlay current={W.current.roomId} onClose={() => setOverlay('none')} />
+          )}
+
+          {/* TOUCH D-PAD (mobile) */}
+          {overlay === 'none' && (
+            <div className="absolute pointer-events-none"
+                 style={{ bottom: 48, right: 16, width: 120, height: 120 }}>
+              {DPAD_BTNS.map(btn => (
+                <button
+                  key={btn.label}
+                  className="pointer-events-auto absolute flex items-center justify-center
+                             rounded-lg select-none active:opacity-60"
+                  style={{
+                    ...btn.style,
+                    width: '34%', height: '34%',
+                    background: 'rgba(30,45,69,0.85)',
+                    border: '1px solid #334155',
+                    color: '#94a3b8',
+                    fontSize: 18,
+                    touchAction: 'none',
+                  }}
+                  onPointerDown={() => {
+                    const key = btn.dx < 0 ? 'a' : btn.dx > 0 ? 'd' : btn.dy < 0 ? 'w' : 's';
+                    W.current.keys.add(key);
+                  }}
+                  onPointerUp={() => {
+                    const key = btn.dx < 0 ? 'a' : btn.dx > 0 ? 'd' : btn.dy < 0 ? 'w' : 's';
+                    W.current.keys.delete(key);
+                  }}
+                  onPointerLeave={() => {
+                    const key = btn.dx < 0 ? 'a' : btn.dx > 0 ? 'd' : btn.dy < 0 ? 'w' : 's';
+                    W.current.keys.delete(key);
+                  }}
+                >
+                  {btn.label}
+                </button>
+              ))}
+            </div>
+          )}
+
+          {/* SKILL BUTTON */}
+          {overlay === 'none' && activeSkill && (
+            <button
+              className="absolute pointer-events-auto flex items-center gap-2 px-3 py-2 rounded-lg text-[11px]"
+              style={{
+                bottom: 12, left: 12,
+                background: 'rgba(30,45,69,0.85)',
+                border: '1px solid #4c1d95',
+                color: '#a78bfa',
+                fontFamily: 'ui-monospace,monospace',
+                cursor: 'pointer',
+              }}
+              onClick={async () => {
+                const res = await callApi('skill', W.current.apiState, ['rotate'], username);
+                W.current.apiState = res._state;
+                localStorage.setItem(`arcadia_${username}`, JSON.stringify(res));
+                setGs(res);
+              }}
+            >
+              ⚡ {activeSkill.name} &nbsp;<span style={{ color: '#475569' }}>[rotate]</span>
             </button>
-          </div>
-        )}
-
-        {/* COMBAT */}
-        {overlay === 'combat' && (
-          <CombatOverlay
-            enemyName={fightName} player={gs.player}
-            events={gs.events} busy={busy}
-            onAttack={handleAttack} onFlee={handleFlee}
-          />
-        )}
-
-        {/* SHOP */}
-        {overlay === 'shop' && (
-          <ShopOverlay
-            shop={gs.shop} player={gs.player}
-            busy={busy} lastEvent={shopTxt}
-            onBuy={handleBuy} onClose={() => setOverlay('none')}
-          />
-        )}
-
-        {/* MAP */}
-        {overlay === 'map' && (
-          <MapOverlay current={W.current.roomId} onClose={() => setOverlay('none')} />
-        )}
+          )}
+        </div>
       </div>
     </div>
   );

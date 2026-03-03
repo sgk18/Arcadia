@@ -263,14 +263,20 @@ export function cmdBuy(prev: EngineState): GameOutput {
   const gs = clone(prev);
   const item = shopExtractMax(gs.shop);
   if (!item) return stateToOutput(gs, "Shop is empty.");
+  if (gs.gold < item.value) {
+    // put it back
+    gs.shop.push(item);
+    shopHeapifyUp(gs.shop, gs.shop.length - 1);
+    return stateToOutput(gs, `Not enough gold. Need ${item.value}g, have ${gs.gold}g.`);
+  }
   if (gs.inventory.length >= GS_MAX_INVENTORY) {
-    // restore
     gs.shop.push(item);
     shopHeapifyUp(gs.shop, gs.shop.length - 1);
     return stateToOutput(gs, "Inventory is full.");
   }
+  gs.gold -= item.value;
   gs.inventory.push(item);
-  enqueueEvent(gs, `Purchased ${item.name} (Value ${item.value}, Rarity ${item.rarity}).`);
+  enqueueEvent(gs, `Bought ${item.name} for ${item.value}g. Gold: ${gs.gold}.`);
   return stateToOutput(gs);
 }
 
