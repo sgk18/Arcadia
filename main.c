@@ -2079,171 +2079,553 @@ static void handleShopMenu(MenuStack *stack, PriorityQueue *pq,
   }
 }
 
-/* ------------------------------ Player Login -------------------------------
- */
-static void loginOrCreatePlayer(Player *player) {
-  if (player == NULL) {
-    return;
-  }
+/* ============================================================
+ *  FLAT PERSISTABLE GAME STATE
+ * ============================================================ */
 
-  char username[MAX_USERNAME_LENGTH];
-  printf("Enter your Arcadian handle: ");
-  readLine(username, sizeof(username));
-  if (username[0] == '\0') {
-    strncpy(username, "Traveler", sizeof(username) - 1U);
-    username[sizeof(username) - 1U] = '\0';
-  }
+#define GS_MAX_INVENTORY 32
+#define GS_MAX_QUESTS    16
+#define GS_MAX_SKILLS     8
+#define GS_MAX_SHOP      16
+#define GS_STATE_FILE    "game_state.dat"
 
-  if (loadPlayer(username, player)) {
-    printf("%sWelcome back, %s.%s\n", ANSI_COLOR_SUCCESS, player->username,
-           ANSI_COLOR_RESET);
+typedef struct {
+  char skill_name[32];
+  int  skill_power;
+} FlatSkill;
+
+typedef struct {
+  /* ---- player ---- */
+  char   username[MAX_USERNAME_LENGTH];
+  int    hp, max_hp, attack, defense, gold, level;
+  /* ---- world ---- */
+  int    room_id;
+  /* ---- inventory ---- */
+  Item   inventory[GS_MAX_INVENTORY];
+  size_t inv_count;
+  /* ---- quests ---- */
+  Quest  quests[GS_MAX_QUESTS];
+  size_t quest_count;
+  /* ---- skill ring (flat + active index) ---- */
+  FlatSkill skills[GS_MAX_SKILLS];
+  size_t    skill_count;
+  size_t    skill_active;
+  /* ---- shop (flat max-heap on rarity) ---- */
+  Item   shop[GS_MAX_SHOP];
+  size_t shop_count;
+  /* ---- event log (circular buffer) ---- */
+  char   events[EVENT_LOG_CAPACITY][EVENT_MESSAGE_LENGTH];
+  size_t event_count;
+  size_t event_head;
+  /* ---- metadata ---- */
+  bool   initialized;
+} GameState;
+
+/* ---------- Static world adjacency ---------- */
+#define ROOM_COUNT 4
+
+static const char *kRoomNames[ROOM_COUNT] = {
+  "Sunlit Entrance", "Forgemaster Armory",
+  "Whispering Library", "Crystal Sanctum"
+};
+
+typedef struct { const char *dir; int dest; } RoomLink;
+static const RoomLink kAdj[ROOM_COUNT][4] = {
+  /* 0 Entrance */ {{"N",1},{"E",2},{NULL,-1},{NULL,-1}},
+  /* 1 Armory   */ {{"S",0},{"E",2},{NULL,-1},{NULL,-1}},
+  /* 2 Library  */ {{"W",1},{"N",3},{NULL,-1},{NULL,-1}},
+  /* 3 Sanctum  */ {{"S",2},{NULL,-1},{NULL,-1},{NULL,-1}},
+};
+
+/* ---- Event log helper ---- */
+static void gsEnqueueEvent(GameState *gs, const char *msg) {
+  if (gs == NULL || msg == NULL) return;
+  size_t idx;
+  if (gs->event_count < EVENT_LOG_CAPACITY) {
+    idx = (gs->event_head + gs->event_count) % EVENT_LOG_CAPACITY;
+    gs->event_count++;
   } else {
-    strncpy(player->username, username, MAX_USERNAME_LENGTH - 1U);
-    player->username[MAX_USERNAME_LENGTH - 1U] = '\0';
-    player->hp = 100;
-    player->max_hp = 100;
-    player->attack = 15;
-    player->defense = 10;
-    player->gold = 125;
-    player->level = 1;
-    printf("%sNew hero registered.%s\n", ANSI_COLOR_SUCCESS, ANSI_COLOR_RESET);
+    idx = gs->event_head;
+    gs->event_head = (gs->event_head + 1U) % EVENT_LOG_CAPACITY;
   }
-
-  pauseScreen();
+  strncpy(gs->events[idx], msg, EVENT_MESSAGE_LENGTH - 1U);
+  gs->events[idx][EVENT_MESSAGE_LENGTH - 1U] = '\0';
 }
 
-/* ---------------------------- Text Interface Loop ------------------------- */
-static void runTextInterface(MenuStack *stack, Player *player,
-                             Inventory *inventory, QuestLog *quests,
-                             Leaderboard *board, WorldGraph *world,
-                             Room **current_room, EventLog *events,
-                             MonsterInfo *bestiary_root, SkillRing *ring,
-                             PriorityQueue *pq) {
-  if (stack == NULL || player == NULL || inventory == NULL || quests == NULL ||
-      board == NULL || world == NULL || current_room == NULL ||
-      events == NULL) {
+/* ---- Shop heap helpers (max-heap on rarity) ---- */
+static void gsShopHeapifyUp(GameState *gs, size_t idx) {
+  while (idx > 0U) {
+    size_t parent = (idx - 1U) / 2U;
+    if (gs->shop[parent].rarity < gs->shop[idx].rarity) {
+      Item tmp = gs->shop[parent];
+      gs->shop[parent] = gs->shop[idx];
+      gs->shop[idx] = tmp;
+      idx = parent;
+    } else {
+      break;
+    }
+  }
+}
+
+static void gsShopHeapifyDown(GameState *gs, size_t idx) {
+  size_t l, r, largest;
+  while (true) {
+    l = 2U * idx + 1U; r = 2U * idx + 2U; largest = idx;
+    if (l < gs->shop_count && gs->shop[l].rarity > gs->shop[largest].rarity)
+      largest = l;
+    if (r < gs->shop_count && gs->shop[r].rarity > gs->shop[largest].rarity)
+      largest = r;
+    if (largest == idx) break;
+    Item tmp = gs->shop[idx];
+    gs->shop[idx] = gs->shop[largest];
+    gs->shop[largest] = tmp;
+    idx = largest;
+  }
+}
+
+static bool gsShopInsert(GameState *gs, const Item *item) {
+  if (gs == NULL || item == NULL || gs->shop_count >= GS_MAX_SHOP) return false;
+  gs->shop[gs->shop_count] = *item;
+  gsShopHeapifyUp(gs, gs->shop_count);
+  gs->shop_count++;
+  return true;
+}
+
+static bool gsShopExtractMax(GameState *gs, Item *out) {
+  if (gs == NULL || gs->shop_count == 0U) return false;
+  if (out != NULL) *out = gs->shop[0];
+  gs->shop_count--;
+  if (gs->shop_count > 0U) {
+    gs->shop[0] = gs->shop[gs->shop_count];
+    gsShopHeapifyDown(gs, 0U);
+  }
+  return true;
+}
+
+/* ---- Load / Save ---- */
+static bool loadGameState(const char *username, GameState *gs) {
+  if (username == NULL || gs == NULL) return false;
+  FILE *f = fopen(GS_STATE_FILE, "rb");
+  if (f == NULL) return false;
+  GameState tmp;
+  bool found = false;
+  while (fread(&tmp, sizeof(GameState), 1U, f) == 1U) {
+    if (strncmp(tmp.username, username, MAX_USERNAME_LENGTH) == 0) {
+      *gs = tmp;
+      found = true;
+      break;
+    }
+  }
+  fclose(f);
+  return found;
+}
+
+static void saveGameState(const GameState *gs) {
+  if (gs == NULL) return;
+  FILE *f = fopen(GS_STATE_FILE, "rb+");
+  if (f != NULL) {
+    GameState tmp;
+    while (fread(&tmp, sizeof(GameState), 1U, f) == 1U) {
+      if (strncmp(tmp.username, gs->username, MAX_USERNAME_LENGTH) == 0) {
+        long pos = (long)(ftell(f) - (long)sizeof(GameState));
+        if (pos >= 0 && fseek(f, pos, SEEK_SET) == 0) {
+          fwrite(gs, sizeof(GameState), 1U, f);
+          fflush(f);
+        }
+        fclose(f);
+        return;
+      }
+    }
+    fwrite(gs, sizeof(GameState), 1U, f);
+    fflush(f);
+    fclose(f);
     return;
   }
-
-  bool running = true;
-  while (running) {
-    MenuState state;
-    if (!peekMenuState(stack, &state)) {
-      break;
-    }
-
-    switch (state) {
-    case MENU_MAIN:
-      running = handleMainMenu(stack, player, inventory, quests, board, world,
-                               current_room);
-      break;
-    case MENU_INVENTORY:
-      handleInventoryMenu(stack, inventory);
-      break;
-    case MENU_QUEST:
-      handleQuestMenu(stack, quests);
-      break;
-    case MENU_LEADERBOARD:
-      handleLeaderboardMenu(stack, board);
-      break;
-    case MENU_WORLD:
-      handleWorldMenu(stack, current_room);
-      break;
-    case MENU_COMBAT:
-      handleCombatMenu(stack, player, events);
-      break;
-    case MENU_BESTIARY:
-      handleBestiaryMenu(stack, bestiary_root);
-      break;
-    case MENU_SKILL:
-      handleSkillMenu(stack, ring);
-      break;
-    case MENU_SHOP:
-      handleShopMenu(stack, pq, inventory);
-      break;
-    default:
-      running = false;
-      break;
-    }
+  f = fopen(GS_STATE_FILE, "wb");
+  if (f != NULL) {
+    fwrite(gs, sizeof(GameState), 1U, f);
+    fclose(f);
   }
 }
 
-/* ----------------------------------- Main ----------------------------------
- */
-int main(void) {
-  MenuStack stack;
-  if (!initMenuStack(&stack)) {
-    fprintf(stderr, "Failed to initialize menu stack.\n");
+/* ---- JSON helpers ---- */
+static void jsonEscapeStr(const char *src, char *dst, size_t cap) {
+  if (dst == NULL || cap == 0U) return;
+  if (src == NULL) { dst[0] = '\0'; return; }
+  size_t wi = 0U;
+  for (size_t i = 0U; src[i] != '\0' && wi + 2U < cap; ++i) {
+    char c = src[i];
+    if      (c == '"')  { if (wi+3U<cap){ dst[wi++]='\\'; dst[wi++]='"';  } }
+    else if (c == '\\') { if (wi+3U<cap){ dst[wi++]='\\'; dst[wi++]='\\'; } }
+    else if (c == '\n') { if (wi+3U<cap){ dst[wi++]='\\'; dst[wi++]='n';  } }
+    else                { dst[wi++] = c; }
+  }
+  dst[wi] = '\0';
+}
+
+static void printJsonOutput(const GameState *gs, const char *error_msg) {
+  char esc[EVENT_MESSAGE_LENGTH * 2];
+  printf("{");
+
+  /* player */
+  jsonEscapeStr(gs->username, esc, sizeof(esc));
+  printf("\"player\":{"
+         "\"username\":\"%s\","
+         "\"hp\":%d,\"max_hp\":%d,"
+         "\"attack\":%d,\"defense\":%d,"
+         "\"gold\":%d,\"level\":%d"
+         "},", esc, gs->hp, gs->max_hp, gs->attack, gs->defense, gs->gold, gs->level);
+
+  /* location */
+  const char *loc = (gs->room_id >= 0 && gs->room_id < ROOM_COUNT)
+                      ? kRoomNames[gs->room_id] : "Unknown";
+  jsonEscapeStr(loc, esc, sizeof(esc));
+  printf("\"location\":\"%s\",", esc);
+
+  /* exits */
+  printf("\"exits\":[");
+  bool first = true;
+  for (int k = 0; k < 4; ++k) {
+    if (kAdj[gs->room_id][k].dir == NULL) break;
+    if (!first) printf(",");
+    printf("\"%s\"", kAdj[gs->room_id][k].dir);
+    first = false;
+  }
+  printf("],");
+
+  /* inventory */
+  printf("\"inventory\":[");
+  for (size_t i = 0U; i < gs->inv_count; ++i) {
+    if (i > 0U) printf(",");
+    jsonEscapeStr(gs->inventory[i].name, esc, sizeof(esc));
+    printf("{\"name\":\"%s\",\"value\":%d,\"rarity\":%d}",
+           esc, gs->inventory[i].value, gs->inventory[i].rarity);
+  }
+  printf("],");
+
+  /* quests */
+  printf("\"quests\":[");
+  for (size_t i = 0U; i < gs->quest_count; ++i) {
+    if (i > 0U) printf(",");
+    char esc2[256];
+    jsonEscapeStr(gs->quests[i].title, esc, sizeof(esc));
+    jsonEscapeStr(gs->quests[i].description, esc2, sizeof(esc2));
+    printf("{\"title\":\"%s\",\"description\":\"%s\"}", esc, esc2);
+  }
+  printf("],");
+
+  /* skills */
+  printf("\"skills\":[");
+  for (size_t i = 0U; i < gs->skill_count; ++i) {
+    if (i > 0U) printf(",");
+    jsonEscapeStr(gs->skills[i].skill_name, esc, sizeof(esc));
+    printf("{\"name\":\"%s\",\"power\":%d,\"active\":%s}",
+           esc, gs->skills[i].skill_power,
+           (gs->skill_count > 0U && i == gs->skill_active) ? "true" : "false");
+  }
+  printf("],");
+
+  /* shop */
+  printf("\"shop\":[");
+  for (size_t i = 0U; i < gs->shop_count; ++i) {
+    if (i > 0U) printf(",");
+    jsonEscapeStr(gs->shop[i].name, esc, sizeof(esc));
+    printf("{\"name\":\"%s\",\"value\":%d,\"rarity\":%d}",
+           esc, gs->shop[i].value, gs->shop[i].rarity);
+  }
+  printf("],");
+
+  /* events */
+  printf("\"events\":[");
+  for (size_t i = 0U; i < gs->event_count; ++i) {
+    if (i > 0U) printf(",");
+    size_t idx = (gs->event_head + i) % EVENT_LOG_CAPACITY;
+    jsonEscapeStr(gs->events[idx], esc, sizeof(esc));
+    printf("\"%s\"", esc);
+  }
+  printf("],");
+
+  /* error */
+  if (error_msg != NULL) {
+    jsonEscapeStr(error_msg, esc, sizeof(esc));
+    printf("\"error\":\"%s\"", esc);
+  } else {
+    printf("\"error\":null");
+  }
+  printf("}\n");
+  fflush(stdout);
+}
+
+/* ---- Seed a brand-new game ---- */
+static void seedNewGame(GameState *gs) {
+  /* Inventory */
+  strncpy(gs->inventory[0].name,"Solar Tonic",31); gs->inventory[0].value=40;  gs->inventory[0].rarity=1;
+  strncpy(gs->inventory[1].name,"Echo Blade",  31); gs->inventory[1].value=125; gs->inventory[1].rarity=3;
+  strncpy(gs->inventory[2].name,"Prism Aegis", 31); gs->inventory[2].value=90;  gs->inventory[2].rarity=2;
+  gs->inv_count = 3U;
+  /* Quests */
+  strncpy(gs->quests[0].title,"Beacon",63);
+  strncpy(gs->quests[0].description,"Restore the lighthouse flames",127);
+  strncpy(gs->quests[1].title,"Relic",63);
+  strncpy(gs->quests[1].description,"Retrieve the crystal heart",127);
+  gs->quest_count = 2U;
+  /* Skills */
+  strncpy(gs->skills[0].skill_name,"Arcane Bolt", 31); gs->skills[0].skill_power=40;
+  strncpy(gs->skills[1].skill_name,"Shadow Dash", 31); gs->skills[1].skill_power=25;
+  strncpy(gs->skills[2].skill_name,"Iron Bastion",31); gs->skills[2].skill_power=55;
+  gs->skill_count  = 3U;
+  gs->skill_active = 0U;
+  /* Shop heap */
+  Item shop_seed[] = {
+    {"Void Crystal",200,5},{"Health Potion",30,1},
+    {"Mana Shard",80,3},   {"Steel Ingot",50,2}
+  };
+  for (size_t i = 0U; i < 4U; ++i) gsShopInsert(gs, &shop_seed[i]);
+}
+
+/* ============================================================
+ *  COMBAT (state-based, writes to event log only)
+ * ============================================================ */
+static void gsCombat(GameState *gs) {
+  if (gs == NULL) return;
+  char msg[EVENT_MESSAGE_LENGTH];
+
+  Combatant player_unit;
+  strncpy(player_unit.name, gs->username, sizeof(player_unit.name) - 1U);
+  player_unit.name[sizeof(player_unit.name) - 1U] = '\0';
+  player_unit.hp       = gs->hp;
+  player_unit.attack   = gs->attack;
+  player_unit.is_player = true;
+
+  Combatant enemies[3] = {
+    {"Goblin Marauder", 35, 8, false},
+    {"Crystal Wisp",    28,10, false},
+    {"Stone Bulwark",   45, 6, false}
+  };
+
+  CombatQueue queue;
+  if (!initCombatQueue(&queue, 8U)) {
+    gsEnqueueEvent(gs, "Combat init failed."); return;
+  }
+
+  enqueueCombatant(&queue, &player_unit);
+  for (size_t i = 0U; i < 3U; ++i) enqueueCombatant(&queue, &enemies[i]);
+
+  while (player_unit.hp > 0 && enemiesRemain(enemies, 3U)) {
+    Combatant *actor = dequeueCombatant(&queue);
+    if (actor == NULL) break;
+    if (actor->hp <= 0) continue;
+
+    if (actor->is_player) {
+      size_t tidx = nextEnemyIndex(enemies, 3U);
+      if (tidx == 3U) { enqueueCombatant(&queue, actor); continue; }
+      Combatant *tgt = &enemies[tidx];
+      int dmg = actor->attack;
+      tgt->hp -= dmg;
+      if (tgt->hp < 0) tgt->hp = 0;
+      snprintf(msg, sizeof(msg), "%s strikes %s for %d damage.",
+               actor->name, tgt->name, dmg);
+      gsEnqueueEvent(gs, msg);
+      if (tgt->hp == 0) {
+        snprintf(msg, sizeof(msg), "%s is defeated!", tgt->name);
+        gsEnqueueEvent(gs, msg);
+      }
+    } else {
+      int dmg = actor->attack - (gs->defense / 4);
+      if (dmg < 1) dmg = 1;
+      player_unit.hp -= dmg;
+      if (player_unit.hp < 0) player_unit.hp = 0;
+      snprintf(msg, sizeof(msg), "%s claws %s for %d damage.",
+               actor->name, player_unit.name, dmg);
+      gsEnqueueEvent(gs, msg);
+    }
+
+    if (actor->hp > 0) enqueueCombatant(&queue, actor);
+  }
+
+  gs->hp = player_unit.hp;
+  if (gs->hp > gs->max_hp) gs->hp = gs->max_hp;
+
+  if (gs->hp > 0) {
+    gs->gold += 25;
+    if (gs->level < 99) gs->level++;
+    snprintf(msg, sizeof(msg), "Victory! +25 gold. Level %d.", gs->level);
+    gsEnqueueEvent(gs, msg);
+  } else {
+    gsEnqueueEvent(gs, "You have fallen in battle.");
+    gs->hp = gs->max_hp / 2;
+    if (gs->hp == 0) gs->hp = 1;
+    snprintf(msg, sizeof(msg), "Revived at %d HP.", gs->hp);
+    gsEnqueueEvent(gs, msg);
+  }
+  freeCombatQueue(&queue);
+}
+
+/* ============================================================
+ *  COMMAND IMPLEMENTATIONS
+ * ============================================================ */
+
+/* init <username> */
+static const char *cmdInit(GameState *gs, const char *username) {
+  if (!username || username[0] == '\0') username = "Traveler";
+  if (loadGameState(username, gs)) {
+    return NULL; /* existing save loaded */
+  }
+  memset(gs, 0, sizeof(GameState));
+  strncpy(gs->username, username, MAX_USERNAME_LENGTH - 1U);
+  gs->username[MAX_USERNAME_LENGTH - 1U] = '\0';
+  gs->hp = 100; gs->max_hp  = 100;
+  gs->attack = 15; gs->defense = 10;
+  gs->gold = 125;  gs->level   = 1;
+  gs->room_id = 0;
+  gs->initialized = true;
+  seedNewGame(gs);
+  gsEnqueueEvent(gs, "A new hero emerges from the mists of Arcadia.");
+  return NULL;
+}
+
+/* combat */
+static const char *cmdCombat(GameState *gs) {
+  gsCombat(gs);
+  return NULL;
+}
+
+/* move <direction> */
+static const char *cmdMove(GameState *gs, const char *dir) {
+  if (!dir || dir[0] == '\0') return "No direction provided.";
+  char upper[8] = {0};
+  for (size_t i = 0U; dir[i] != '\0' && i < 7U; ++i)
+    upper[i] = (dir[i] >= 'a' && dir[i] <= 'z') ? (char)(dir[i] - 32) : dir[i];
+  if (gs->room_id < 0 || gs->room_id >= ROOM_COUNT) return "Invalid room state.";
+  for (int k = 0; k < 4; ++k) {
+    if (kAdj[gs->room_id][k].dir == NULL) break;
+    if (strncmp(kAdj[gs->room_id][k].dir, upper, 8) == 0) {
+      int dest = kAdj[gs->room_id][k].dest;
+      char msg[EVENT_MESSAGE_LENGTH];
+      snprintf(msg, sizeof(msg), "Traveled %s to %s.", upper, kRoomNames[dest]);
+      gsEnqueueEvent(gs, msg);
+      gs->room_id = dest;
+      return NULL;
+    }
+  }
+  return "No passage in that direction.";
+}
+
+/* buy — extract highest-rarity item from shop into inventory */
+static const char *cmdBuy(GameState *gs) {
+  Item bought;
+  if (!gsShopExtractMax(gs, &bought)) return "Shop is empty.";
+  if (gs->inv_count >= GS_MAX_INVENTORY) {
+    gsShopInsert(gs, &bought); /* restore */
+    return "Inventory is full.";
+  }
+  gs->inventory[gs->inv_count++] = bought;
+  char msg[EVENT_MESSAGE_LENGTH];
+  snprintf(msg, sizeof(msg), "Purchased %s (Value %d, Rarity %d).",
+           bought.name, bought.value, bought.rarity);
+  gsEnqueueEvent(gs, msg);
+  return NULL;
+}
+
+/* skill rotate */
+static const char *cmdSkillRotate(GameState *gs) {
+  if (gs->skill_count == 0U) return "No skills available.";
+  gs->skill_active = (gs->skill_active + 1U) % gs->skill_count;
+  char msg[EVENT_MESSAGE_LENGTH];
+  snprintf(msg, sizeof(msg), "Active skill: %s.",
+           gs->skills[gs->skill_active].skill_name);
+  gsEnqueueEvent(gs, msg);
+  return NULL;
+}
+
+/* skill learn <name> <power> */
+static const char *cmdSkillLearn(GameState *gs, const char *name, int power) {
+  if (!name || name[0] == '\0') return "Skill name required.";
+  if (gs->skill_count >= GS_MAX_SKILLS) return "Skill ring is full.";
+  strncpy(gs->skills[gs->skill_count].skill_name, name, 31U);
+  gs->skills[gs->skill_count].skill_name[31U] = '\0';
+  gs->skills[gs->skill_count].skill_power = power;
+  gs->skill_count++;
+  char msg[EVENT_MESSAGE_LENGTH];
+  snprintf(msg, sizeof(msg), "Learned skill: %s (Power %d).", name, power);
+  gsEnqueueEvent(gs, msg);
+  return NULL;
+}
+
+/* ============================================================
+ *  MAIN — CLI DISPATCHER
+ *
+ *  Commands:
+ *    arcadia init   <username>
+ *    arcadia combat <username>
+ *    arcadia move   <username> <direction>
+ *    arcadia buy    <username>
+ *    arcadia skill  <username> rotate
+ *    arcadia skill  <username> learn <name> <power>
+ *
+ *  Stdout: single-line JSON game state (no other output).
+ * ============================================================ */
+int main(int argc, char *argv[]) {
+  if (argc < 2) {
+    fprintf(stdout, "{\"error\":\"Usage: arcadia <command> <username> [args]\"}\n");
     return EXIT_FAILURE;
   }
 
-  if (!pushMenuState(&stack, MENU_MAIN)) {
-    fprintf(stderr, "Failed to seed menu stack.\n");
-    freeMenuStack(&stack);
-    return EXIT_FAILURE;
+  const char *cmd = argv[1];
+  GameState gs;
+  memset(&gs, 0, sizeof(GameState));
+  const char *err = NULL;
+
+  if (strcmp(cmd, "init") == 0) {
+    const char *uname = (argc >= 3) ? argv[2] : "Traveler";
+    err = cmdInit(&gs, uname);
+
+  } else {
+    /* All stateful commands: argv[2] = username */
+    const char *uname = (argc >= 3) ? argv[2] : NULL;
+    if (uname == NULL || uname[0] == '\0') {
+      fprintf(stdout,
+              "{\"error\":\"Username required as second argument.\"}\n");
+      return EXIT_FAILURE;
+    }
+
+    if (!loadGameState(uname, &gs)) {
+      fprintf(stdout,
+              "{\"error\":\"No save found for '%s'. Run init first.\"}\n",
+              uname);
+      return EXIT_FAILURE;
+    }
+
+    if (strcmp(cmd, "combat") == 0) {
+      err = cmdCombat(&gs);
+
+    } else if (strcmp(cmd, "move") == 0) {
+      const char *dir = (argc >= 4) ? argv[3] : "";
+      err = cmdMove(&gs, dir);
+
+    } else if (strcmp(cmd, "buy") == 0) {
+      err = cmdBuy(&gs);
+
+    } else if (strcmp(cmd, "skill") == 0) {
+      const char *action = (argc >= 4) ? argv[3] : "";
+      if (strcmp(action, "rotate") == 0) {
+        err = cmdSkillRotate(&gs);
+      } else if (strcmp(action, "learn") == 0) {
+        const char *sname  = (argc >= 5) ? argv[4] : "";
+        int         spower = (argc >= 6) ? (int)strtol(argv[5], NULL, 10) : 10;
+        err = cmdSkillLearn(&gs, sname, spower);
+      } else {
+        err = "Unknown skill action. Use: rotate | learn <name> <power>.";
+      }
+
+    } else {
+      err = "Unknown command. Valid: init | combat | move | buy | skill.";
+    }
   }
 
-  Player player;
-  Inventory inventory;
-  initInventory(&inventory);
-
-  QuestLog quests;
-  initQuestLog(&quests);
-
-  Leaderboard board;
-  initLeaderboard(&board);
-
-  EventLog events;
-  if (!initEventLog(&events, EVENT_LOG_CAPACITY)) {
-    fprintf(stderr, "Failed to initialize event log.\n");
-    freeMenuStack(&stack);
-    return EXIT_FAILURE;
-  }
-
-  WorldGraph world;
-  initWorldGraph(&world);
-  if (!buildDefaultWorld(&world)) {
-    fprintf(stderr, "Failed to build world graph.\n");
-    freeEventLog(&events);
-    freeMenuStack(&stack);
-    return EXIT_FAILURE;
-  }
-
-  Room *current_room = (world.count > 0U) ? world.rooms[0U] : NULL;
-  MonsterInfo *bestiary_root = NULL;
-
-  /* Init new data structures */
-  initSkillRing(&gSkillRing);
-  initPriorityQueue(&gShopQueue);
-
-  seedDemoData(&player, &inventory, &quests, &board, &bestiary_root);
-
-  /* Seed Skill Ring with starter skills */
-  addSkill(&gSkillRing, "Arcane Bolt", 40);
-  addSkill(&gSkillRing, "Shadow Dash", 25);
-  addSkill(&gSkillRing, "Iron Bastion", 55);
-
-  /* Seed Shop Priority Queue */
-  Item shop_items[] = {{"Void Crystal", 200, 5},
-                       {"Health Potion", 30, 1},
-                       {"Mana Shard", 80, 3},
-                       {"Steel Ingot", 50, 2}};
-  for (size_t si = 0U; si < 4U; ++si) {
-    pqInsert(&gShopQueue, &shop_items[si]);
-  }
-
-  loginOrCreatePlayer(&player);
-  runTextInterface(&stack, &player, &inventory, &quests, &board, &world,
-                   &current_room, &events, bestiary_root, &gSkillRing,
-                   &gShopQueue);
-
-  savePlayer(&player);
-  freeInventory(&inventory);
-  freeQuestLog(&quests);
-  freeEventLog(&events);
-  freeWorldGraph(&world);
-  freeBestiary(bestiary_root);
-  freeSkillRing(&gSkillRing);
-  freeMenuStack(&stack);
+  saveGameState(&gs);
+  printJsonOutput(&gs, err);
   return EXIT_SUCCESS;
 }
+
+
