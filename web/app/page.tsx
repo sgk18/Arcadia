@@ -1,895 +1,983 @@
-"use client";
-import { useEffect, useRef, useState, useCallback } from "react";
+'use client';
+import { useEffect, useRef, useState, useCallback } from 'react';
 
-/* ─────────────────────────────────────────────────────────── types ── */
-interface PlayerStats { username:string; hp:number; max_hp:number; attack:number; defense:number; gold:number; level:number; }
-interface ItemEntry   { name:string; value:number; rarity:number; }
-interface QuestEntry  { title:string; description:string; }
-interface SkillEntry  { name:string; power:number; active:boolean; }
-interface GameState   { player:PlayerStats; location:string; exits:string[]; inventory:ItemEntry[]; quests:QuestEntry[]; skills:SkillEntry[]; shop:ItemEntry[]; events:string[]; error:string|null; _state?:Record<string,unknown>; }
+/* ═══════════════════════════════════════════════════════════════════════
+   CONSTANTS
+═══════════════════════════════════════════════════════════════════════ */
+const TILE   = 40;
+const COLS   = 20;
+const ROWS   = 13;
+const CW     = TILE * COLS;   // 800 px
+const CH     = TILE * ROWS;   // 520 px
+const PL_R   = 13;            // player radius
+const EN_R   = 14;            // enemy radius
+const SH_R   = 16;            // shop NPC radius
+const PL_SPD = 3.6;
+const EN_SPD = 0.75;
 
-async function callGame(command:string,username:string,args:string[]=[],state?:Record<string,unknown>):Promise<GameState> {
-  const res = await fetch("/api/game",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({command,username,args,state})});
-  return await res.json() as GameState;
+/* ═══════════════════════════════════════════════════════════════════════
+   TILE SYSTEM
+═══════════════════════════════════════════════════════════════════════ */
+const FLOOR = 0, WALL = 1, DN = 2, DS = 3, DE = 4, DW = 5;
+type TT = 0 | 1 | 2 | 3 | 4 | 5;
+
+function parseTile(c: string): TT {
+  switch (c) {
+    case '#': return WALL;
+    case 'N': return DN;
+    case 'S': return DS;
+    case 'E': return DE;
+    case 'W': return DW;
+    default:  return FLOOR;
+  }
+}
+function parseRoom(rows: string[]): TT[][] {
+  return rows.map(r => [...r].map(parseTile));
 }
 
-/* ───────────────────────────────────────────────────── static data ── */
-const ROOM_NAMES  = ["Sunlit Entrance","Forgemaster Armory","Whispering Library","Crystal Sanctum"];
-const ROOM_ICONS  = ["☀","⚔","📚","💎"];
-const ROOM_COORDS = ["79.2 / 44.1","42.1 / 88.3","65.0 / 31.7","51.8 / 77.4"];
-const ROOM_POS    = [{x:350,y:360},{x:145,y:175},{x:465,y:268},{x:545,y:100}];
-const ROOM_ADJ    = [[{dir:"N",dest:1},{dir:"E",dest:2}],[{dir:"S",dest:0},{dir:"E",dest:2}],[{dir:"W",dest:1},{dir:"N",dest:3}],[{dir:"S",dest:2}]];
-const MAP_EDGES:number[][] = [[0,1],[0,2],[1,2],[2,3]];
+/* ═══════════════════════════════════════════════════════════════════════
+   ROOM MAPS  (20 wide x 13 tall)
+═══════════════════════════════════════════════════════════════════════ */
+const ROOM_MAPS: TT[][][] = [
 
-const RARITY_NAME  = ["","Common","Uncommon","Rare","Epic","Legendary"];
-const RARITY_CLASS = ["","r-common","r-uncommon","r-rare","r-epic","r-legendary"];
+  /* 0 - Sunlit Entrance   exits: N -> Armory, E -> Library */
+  parseRoom([
+    '##########NN########',
+    '#..................#',
+    '#....####......#...#',
+    '#....#.........#...#',
+    '#..................#',
+    '#...........####...#',
+    '#..................EE',
+    '#...........####...EE',
+    '#..................#',
+    '#....#.........#...#',
+    '#....####......#...#',
+    '#..................#',
+    '####################',
+  ]),
 
-function getRoomId(loc:string):number { const i=ROOM_NAMES.indexOf(loc); return i>=0?i:0; }
-function getTravelDir(from:number,to:number):string|null { return ROOM_ADJ[from]?.find(l=>l.dest===to)?.dir??null; }
+  /* 1 - Forgemaster Armory  exits: S -> Entrance, E -> Library */
+  parseRoom([
+    '####################',
+    '#..................#',
+    '#..####........#...#',
+    '#..#...........#...#',
+    '#..................#',
+    '#....###...###.....EE',
+    '#..................EE',
+    '#....###...###.....#',
+    '#..................#',
+    '#..#...........####.#',
+    '#..#...............#',
+    '#..................#',
+    '##########SS########',
+  ]),
 
-/* ──────────────────────────────────────────────────── Spinner ── */
-function Spinner(){
-  return <svg className="spin" style={{width:13,height:13,flexShrink:0}} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2.5}><circle cx={12} cy={12} r={9} strokeOpacity={.25}/><path d="M12 3a9 9 0 0 1 9 9"/></svg>;
+  /* 2 - Whispering Library  exits: W -> Armory, N -> Sanctum */
+  parseRoom([
+    '##########NN########',
+    '#..................#',
+    '#..#####.....#####.#',
+    '#..................#',
+    '#..................#',
+    'WW.................#',
+    '#..................#',
+    'WW.................#',
+    '#..................#',
+    '#..................#',
+    '#..#####.....#####.#',
+    '#..................#',
+    '####################',
+  ]),
+
+  /* 3 - Crystal Sanctum   exits: S -> Library */
+  parseRoom([
+    '####################',
+    '#..................#',
+    '#..###.......###...#',
+    '#..................#',
+    '#....#.........#...#',
+    '#....##.......##...#',
+    '#..................#',
+    '#....##.......##...#',
+    '#....#.........#...#',
+    '#..................#',
+    '#..###.......###...#',
+    '#..................#',
+    '##########SS########',
+  ]),
+];
+
+/* ═══════════════════════════════════════════════════════════════════════
+   ROOM THEMES
+═══════════════════════════════════════════════════════════════════════ */
+const THEMES = [
+  { floor: '#14213d', wall: '#0a1020', wallTop: '#1e3a5f', door: '#2563eb',  glow: '#60a5fa', accent: '#fbbf24', name: 'Sunlit Entrance'    },
+  { floor: '#1c0a00', wall: '#0e0500', wallTop: '#4c1010', door: '#dc2626',  glow: '#f87171', accent: '#f97316', name: 'Forgemaster Armory' },
+  { floor: '#0c0f2a', wall: '#07080f', wallTop: '#1e1b4b', door: '#7c3aed',  glow: '#a78bfa', accent: '#818cf8', name: 'Whispering Library' },
+  { floor: '#001e1e', wall: '#050e0e', wallTop: '#0a3344', door: '#0891b2',  glow: '#22d3ee', accent: '#06b6d4', name: 'Crystal Sanctum'    },
+];
+
+/* ═══════════════════════════════════════════════════════════════════════
+   DOOR EXIT TABLE
+═══════════════════════════════════════════════════════════════════════ */
+interface DoorExit { dir: string; tile: TT; destRoom: number; spawnX: number; spawnY: number; }
+
+const ROOM_EXITS: DoorExit[][] = [
+  /* 0 */ [
+    { dir: 'N', tile: DN, destRoom: 1, spawnX: 9.5 * TILE, spawnY: 10.5 * TILE },
+    { dir: 'E', tile: DE, destRoom: 2, spawnX:  1.5 * TILE, spawnY:  6.5 * TILE },
+  ],
+  /* 1 */ [
+    { dir: 'S', tile: DS, destRoom: 0, spawnX: 9.5 * TILE, spawnY:  1.5 * TILE },
+    { dir: 'E', tile: DE, destRoom: 2, spawnX:  1.5 * TILE, spawnY:  6.5 * TILE },
+  ],
+  /* 2 */ [
+    { dir: 'W', tile: DW, destRoom: 1, spawnX: 18.5 * TILE, spawnY:  6.5 * TILE },
+    { dir: 'N', tile: DN, destRoom: 3, spawnX:  9.5 * TILE, spawnY: 10.5 * TILE },
+  ],
+  /* 3 */ [
+    { dir: 'S', tile: DS, destRoom: 2, spawnX:  9.5 * TILE, spawnY:  1.5 * TILE },
+  ],
+];
+
+/* ═══════════════════════════════════════════════════════════════════════
+   ENEMY DEFINITIONS
+═══════════════════════════════════════════════════════════════════════ */
+interface EnemyDef { tx: number; ty: number; name: string; col: string; }
+
+const ENEMY_DEFS: EnemyDef[][] = [
+  /* 0 */ [
+    { tx: 5,  ty: 8, name: 'Shadow Wisp',   col: '#7c3aed' },
+    { tx: 14, ty: 4, name: 'Stone Golem',   col: '#94a3b8' },
+  ],
+  /* 1 */ [
+    { tx: 4,  ty: 3, name: 'Forge Drake',   col: '#ef4444' },
+    { tx: 14, ty: 8, name: 'Slag Imp',      col: '#f97316' },
+    { tx: 9,  ty: 5, name: 'Ash Knight',    col: '#dc2626' },
+  ],
+  /* 2 */ [
+    { tx: 6,  ty: 5, name: 'Scroll Wraith', col: '#818cf8' },
+    { tx: 15, ty: 9, name: 'Ink Phantom',   col: '#6366f1' },
+  ],
+  /* 3 */ [
+    { tx: 6,  ty: 4, name: 'Crystal Golem', col: '#22d3ee' },
+    { tx: 13, ty: 8, name: 'Prism Knight',  col: '#06b6d4' },
+    { tx: 9,  ty: 6, name: 'Void Wraith',   col: '#67e8f9' },
+  ],
+];
+
+/* Shop NPC locations per room: [roomId, tileX, tileY] */
+const SHOP_SPAWNS: [number, number, number][] = [
+  [0, 16, 10],
+  [3,  4, 10],
+];
+
+/* ═══════════════════════════════════════════════════════════════════════
+   RUNTIME ENTITY TYPES
+═══════════════════════════════════════════════════════════════════════ */
+interface Enemy {
+  id: number; x: number; y: number; vx: number; vy: number;
+  name: string; col: string; alive: boolean; wanderTimer: number;
 }
 
-/* ──────────────────────────────────────────────── SynthwaveHero ── */
-function SynthwaveHero(){
-  return (
-    <svg viewBox="0 0 800 280" style={{display:"block",width:"100%",borderRadius:"8px 8px 0 0"}}>
-      <defs>
-        <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%"   stopColor="#0a0e1a"/>
-          <stop offset="22%"  stopColor="#18092e"/>
-          <stop offset="42%"  stopColor="#6b2040"/>
-          <stop offset="57%"  stopColor="#c4522a"/>
-          <stop offset="65%"  stopColor="#e8813a"/>
-          <stop offset="72%"  stopColor="#c4522a"/>
-          <stop offset="86%"  stopColor="#3d1030"/>
-          <stop offset="100%" stopColor="#0d1117"/>
-        </linearGradient>
-        <clipPath id="sc"><circle cx="400" cy="142" r="72"/></clipPath>
-      </defs>
-      <rect width="800" height="280" fill="url(#sky)"/>
-      <ellipse cx="400" cy="142" rx="112" ry="90" fill="rgba(232,129,58,.28)"/>
-      <circle cx="400" cy="142" r="72" fill="#e07830"/>
-      {[0,1,2,3,4,5,6,7].map(i=>(
-        <line key={i} x1="328" y1={154+i*9} x2="472" y2={154+i*9}
-              stroke="#0d1117" strokeWidth={i<2?3:2} opacity={.5+i*.04} clipPath="url(#sc)"/>
-      ))}
-      <polygon points="0,232 70,152 155,212 240,132 315,182 375,122 435,175 505,135 575,185 648,140 715,192 800,145 800,280 0,280" fill="#0d2535" opacity=".93"/>
-      <polygon points="0,265 55,218 125,250 200,192 272,236 355,182 425,227 495,186 562,232 642,191 722,226 800,196 800,280 0,280" fill="#060f1a"/>
-      <g opacity=".3">
-        {[0,1,2,3,4].map(i=><line key={i} x1="0" y1={255+i*6} x2="800" y2={255+i*6} stroke="#cc4a2a" strokeWidth=".8"/>)}
-        {[-8,-6,-4,-2,0,2,4,6,8].map(i=><line key={i} x1={400+i*55} y1={250} x2={400+i*235} y2={282} stroke="#cc4a2a" strokeWidth=".8"/>)}
-      </g>
-      <text x="400" y="116" textAnchor="middle" fontFamily="ui-monospace,monospace" fontWeight="900" fontSize="66" fontStyle="italic" letterSpacing="10" fill="none" stroke="#38bdf8" strokeWidth="1.8" opacity=".88">ARCADIA</text>
-      <text x="400" y="116" textAnchor="middle" fontFamily="ui-monospace,monospace" fontWeight="900" fontSize="66" fontStyle="italic" letterSpacing="10" fill="#3b82f6" opacity=".45">ARCADIA</text>
-      <line x1="330" y1="126" x2="470" y2="126" stroke="#3b82f6" strokeWidth="1.5" opacity=".6"/>
-    </svg>
-  );
+interface ShopNpc { x: number; y: number; }
+
+interface PlayerInfo {
+  username: string; hp: number; max_hp: number;
+  attack: number; defense: number; gold: number; level: number;
+}
+interface ItemInfo  { name: string; value: number; rarity: number; }
+interface SkillInfo { name: string; power: number; active: boolean; }
+interface ApiResult {
+  player: PlayerInfo;
+  location: string;
+  exits: string[];
+  events: string[];
+  skills: SkillInfo[];
+  shop: ItemInfo[];
+  error: string | null;
+  _state: unknown;
 }
 
-/* ──────────────────────────────────────────────── LoginScreen ── */
-function LoginScreen({onLogin}:{onLogin:(n:string)=>void}){
-  const [mode,setMode]       = useState<null|"input">(null);
-  const [name,setName]       = useState("");
-  const [loading,setLoading] = useState(false);
-  const [err,setErr]         = useState<string|null>(null);
-  const inputRef = useRef<HTMLInputElement>(null);
-  useEffect(()=>{if(mode==="input")inputRef.current?.focus();},[mode]);
+type Overlay = 'none' | 'combat' | 'shop' | 'map';
 
-  async function handleSubmit(e:React.FormEvent){
-    e.preventDefault();
-    const n=name.trim()||"Traveler";
-    setLoading(true);setErr(null);
-    try{
-      const gs=await callGame("init",n);
-      if(gs.error)setErr(gs.error);else onLogin(n);
-    }catch(ex){setErr(String(ex));}
-    finally{setLoading(false);}
+/* ═══════════════════════════════════════════════════════════════════════
+   API HELPER
+═══════════════════════════════════════════════════════════════════════ */
+async function callApi(
+  command: string,
+  state: unknown,
+  args: string[] = [],
+  username = '',
+): Promise<ApiResult> {
+  const body: Record<string, unknown> = { command, args, username };
+  if (state) body.state = state;
+  const res = await fetch('/api/game', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  return res.json() as Promise<ApiResult>;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   WORLD HELPERS
+═══════════════════════════════════════════════════════════════════════ */
+function tileAt(map: TT[][], px: number, py: number): TT {
+  const col = Math.floor(px / TILE);
+  const row = Math.floor(py / TILE);
+  if (row < 0 || row >= ROWS || col < 0 || col >= COLS) return WALL;
+  return map[row][col];
+}
+
+function isDoorTile(t: TT): boolean { return t === DN || t === DS || t === DE || t === DW; }
+
+function spawnEnemies(roomId: number): Enemy[] {
+  return ENEMY_DEFS[roomId].map((d, i) => ({
+    id: i,
+    x: (d.tx + 0.5) * TILE, y: (d.ty + 0.5) * TILE,
+    vx: 0, vy: 0,
+    name: d.name, col: d.col,
+    alive: true,
+    wanderTimer: 60 + Math.random() * 120,
+  }));
+}
+
+function buildShopNpcs(roomId: number): ShopNpc[] {
+  return SHOP_SPAWNS
+    .filter(([r]) => r === roomId)
+    .map(([, tx, ty]) => ({ x: (tx + 0.5) * TILE, y: (ty + 0.5) * TILE }));
+}
+
+function dist2d(ax: number, ay: number, bx: number, by: number): number {
+  return Math.sqrt((ax - bx) ** 2 + (ay - by) ** 2);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   CANVAS DRAW HELPERS
+═══════════════════════════════════════════════════════════════════════ */
+function drawRoom(ctx: CanvasRenderingContext2D, map: TT[][], th: typeof THEMES[0], t: number) {
+  for (let row = 0; row < ROWS; row++) {
+    for (let col = 0; col < COLS; col++) {
+      const tile = map[row][col];
+      const x = col * TILE, y = row * TILE;
+
+      if (tile === WALL) {
+        ctx.fillStyle = th.wall;
+        ctx.fillRect(x, y, TILE, TILE);
+        ctx.fillStyle = th.wallTop;
+        ctx.fillRect(x, y, TILE, 8);
+      } else if (tile === FLOOR) {
+        ctx.fillStyle = th.floor;
+        ctx.fillRect(x, y, TILE, TILE);
+        ctx.strokeStyle = 'rgba(255,255,255,0.025)';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(x + 0.5, y + 0.5, TILE - 1, TILE - 1);
+      } else {
+        /* door tile */
+        ctx.fillStyle = th.floor;
+        ctx.fillRect(x, y, TILE, TILE);
+        ctx.fillStyle = th.door + '44';
+        ctx.fillRect(x, y, TILE, TILE);
+        const pulse = 0.5 + 0.5 * Math.sin(t * 0.05);
+        ctx.globalAlpha = 0.4 + 0.4 * pulse;
+        ctx.fillStyle = th.glow;
+        ctx.fillRect(x + TILE * 0.35, y + TILE * 0.35, TILE * 0.3, TILE * 0.3);
+        ctx.globalAlpha = 1;
+      }
+    }
+  }
+}
+
+function drawGlowCircle(
+  ctx: CanvasRenderingContext2D,
+  x: number, y: number, r: number,
+  bodyCol: string, glowCol: string,
+  label?: string,
+) {
+  const g = ctx.createRadialGradient(x, y, 0, x, y, r * 2.8);
+  g.addColorStop(0, glowCol + '88');
+  g.addColorStop(1, 'transparent');
+  ctx.fillStyle = g;
+  ctx.beginPath();
+  ctx.arc(x, y, r * 2.8, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.fillStyle = bodyCol;
+  ctx.beginPath();
+  ctx.arc(x, y, r, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.strokeStyle = glowCol;
+  ctx.lineWidth = 2;
+  ctx.stroke();
+
+  if (label) {
+    ctx.fillStyle = '#cbd5e1';
+    ctx.font = '9px ui-monospace,monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText(label, x, y - r - 5);
+    ctx.textAlign = 'left';
+  }
+}
+
+function drawPlayer(ctx: CanvasRenderingContext2D, x: number, y: number, th: typeof THEMES[0]) {
+  drawGlowCircle(ctx, x, y, PL_R, '#3b82f6', th.glow);
+  ctx.fillStyle = '#fff';
+  ctx.beginPath();
+  ctx.arc(x, y - 5, 3, 0, Math.PI * 2);
+  ctx.fill();
+}
+
+function drawShopNpc(ctx: CanvasRenderingContext2D, npc: ShopNpc, frame: number) {
+  const pulse = 0.75 + 0.25 * Math.sin(frame * 0.05);
+  ctx.globalAlpha = pulse;
+  drawGlowCircle(ctx, npc.x, npc.y, SH_R, '#92400e', '#fde68a', 'SHOP  [E]');
+  ctx.globalAlpha = 1;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   LOGIN SCREEN
+═══════════════════════════════════════════════════════════════════════ */
+function LoginScreen({ onLogin }: { onLogin: (u: string) => void }) {
+  const [name, setName] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  function submit() {
+    if (busy) return;
+    setBusy(true);
+    onLogin(name.trim() || 'Traveler');
   }
 
-  return(
-    <div className="min-h-screen bg-[#0a0e1a] flex flex-col" style={{fontFamily:"ui-monospace,monospace"}}>
-      {/* header */}
-      <header className="flex items-center justify-between px-5 py-3 border-b border-[#1e2d45]">
-        <div className="flex items-center gap-2">
-          <div className="w-6 h-6 rounded bg-blue-600 flex items-center justify-center font-black text-white text-xs">A</div>
-          <span className="font-bold text-sm text-[#e2e8f0] tracking-wider">ARCADIA OS</span>
-        </div>
-        <div className="flex items-center gap-3">
-          <span className="flex items-center gap-1.5 text-[11px] text-[#64748b]">
-            <span className="dot-green"/>SESSION: ACTIVE
-          </span>
-          <span className="badge">v2.0.4-STABLE</span>
-        </div>
-      </header>
-
-      <div className="flex-1 flex flex-col items-center justify-center px-4 py-10 gap-5 w-full max-w-md mx-auto">
-        {/* hero card */}
-        <div className="w-full rounded-xl overflow-hidden border border-[#1e2d45]" style={{boxShadow:"0 0 40px rgba(37,99,235,.1)"}}>
-          <SynthwaveHero/>
-          <div className="bg-[#111827] px-5 py-3 flex items-center justify-between border-t border-[#1e2d45]">
-            <span className="text-[11px] text-[#64748b] uppercase tracking-widest flex items-center gap-2">
-              <span className="live-dot"/>SYSTEM ONLINE
-            </span>
-            <span className="text-[11px] text-[#334155]">©2077 ARCADIA CORP</span>
-          </div>
-        </div>
-
-        {/* buttons / form */}
-        {mode===null?(
-          <div className="w-full space-y-2.5">
-            <button className="btn-os btn-primary w-full py-3" onClick={()=>setMode("input")}>▶ New Game</button>
-            <button className="btn-os btn-secondary w-full py-3 justify-between" onClick={()=>setMode("input")}>
-              <span>↺ Load Save</span><span className="badge">ALGO: DIJKSTRA</span>
-            </button>
-            <button className="btn-os btn-secondary w-full py-3 justify-between" disabled>
-              <span>⊞ Leaderboard</span><span className="badge">SEARCH: BINARY</span>
-            </button>
-          </div>
-        ):(
-          <form onSubmit={handleSubmit} className="w-full space-y-3">
-            <label className="block text-[11px] text-[#64748b] uppercase tracking-widest">Enter access handle</label>
-            <div className="flex items-center gap-2 border border-[#1e2d45] bg-[#0f1728] rounded-lg px-4 py-3 focus-within:border-blue-500 transition-colors">
-              <span className="text-blue-400 text-sm">$</span>
-              <input ref={inputRef} value={name} onChange={e=>setName(e.target.value)}
-                     placeholder="Traveler" maxLength={31}
-                     className="flex-1 bg-transparent text-[#e2e8f0] text-sm outline-none placeholder:text-[#334155]"/>
-            </div>
-            {err&&<p className="text-red-400 text-xs flex items-center gap-1">✕ {err}</p>}
-            <div className="flex gap-2">
-              <button type="button" className="btn-os btn-ghost-os flex-1" onClick={()=>{setMode(null);setErr(null);}}>← Back</button>
-              <button type="submit" className="btn-os btn-primary flex-1" disabled={loading}>
-                {loading&&<Spinner/>}{loading?"Initializing…":"Enter Arcadia ▶"}
-              </button>
-            </div>
-          </form>
-        )}
-
-        <button className="text-[11px] text-[#334155] hover:text-[#64748b] transition-colors bg-transparent border-none cursor-pointer uppercase tracking-widest">
-          System Settings
-        </button>
+  return (
+    <div className="min-h-screen flex flex-col items-center justify-center"
+         style={{ background: '#0a0e1a', fontFamily: 'ui-monospace,monospace' }}>
+      <div className="mb-10 text-center select-none">
+        <p className="text-[11px] tracking-[0.5em] text-[#2563eb] mb-3 uppercase">Neural Protocol Active</p>
+        <h1 className="text-6xl font-black tracking-widest text-white mb-2"
+            style={{ textShadow: '0 0 40px #2563eb, 0 0 80px #2563eb55' }}>
+          ARCADIA
+        </h1>
+        <p className="text-[#475569] text-xs tracking-[0.3em] uppercase">2D Dungeon Explorer</p>
       </div>
 
-      <footer className="flex items-center justify-center flex-wrap gap-5 px-5 py-3 border-t border-[#1e2d45] text-[10px] text-[#334155]">
-        <span className="flex items-center gap-1.5"><span className="dot-green"/>Kernel Stable</span>
-        <span className="flex items-center gap-1.5"><span className="dot-blue"/>DB: Connected</span>
-        <span>LATENCY: 12ms • NODE STATUS: HEALTHY</span>
-      </footer>
+      <div className="w-80 p-6 rounded-xl border" style={{ background: '#111827', borderColor: '#1e2d45' }}>
+        <p className="text-[10px] tracking-widest text-[#64748b] uppercase mb-4">Enter Designation</p>
+        <input
+          className="w-full bg-[#0a0e1a] border border-[#1e2d45] rounded-lg px-4 py-3 text-white
+                     text-sm outline-none focus:border-[#2563eb] transition-colors mb-4"
+          placeholder="Traveler"
+          value={name}
+          onChange={e => setName(e.target.value)}
+          onKeyDown={e => e.key === 'Enter' && submit()}
+          autoFocus
+        />
+        <button
+          onClick={submit} disabled={busy}
+          className="w-full py-3 rounded-lg text-sm font-bold tracking-widest uppercase transition-all"
+          style={{ background: busy ? '#1e3a5f' : '#2563eb', color: '#fff',
+                   opacity: busy ? 0.7 : 1, cursor: busy ? 'not-allowed' : 'pointer' }}>
+          {busy ? 'Initialising...' : 'Enter Arcadia'}
+        </button>
+        <p className="text-center text-[#334155] text-[10px] mt-4 tracking-wide">
+          WASD / Arrows to move &nbsp;|&nbsp; E to interact
+        </p>
+      </div>
     </div>
   );
 }
 
-/* ──────────────────────────────────────────────── WorldMapSVG ── */
-function WorldMapSVG({gs,onTravel,busy}:{gs:GameState;onTravel:(dir:string)=>void;busy:boolean}){
-  // `clicked` = user click-locked a destination; `hovered` = transient mouse-over
-  const [clicked,setClicked] = useState<number|null>(null);
-  const [hovered,setHovered] = useState<number|null>(null);
-  const currentId   = getRoomId(gs.location);
-  const adjacentIds = ROOM_ADJ[currentId]?.map(l=>l.dest)??[];
+/* ═══════════════════════════════════════════════════════════════════════
+   HUD
+═══════════════════════════════════════════════════════════════════════ */
+function Hud({
+  player, roomName, events, skills, onMap, onLogout,
+}: {
+  player: PlayerInfo; roomName: string; events: string[];
+  skills: SkillInfo[]; onMap: () => void; onLogout: () => void;
+}) {
+  const hpPct = Math.max(0, player.hp / player.max_hp) * 100;
+  const active = skills.find(s => s.active);
 
-  // reset selection whenever the room changes
-  useEffect(()=>{ setClicked(null); setHovered(null); },[gs.location]);
+  return (
+    <div className="pointer-events-none absolute inset-0" style={{ fontFamily: 'ui-monospace,monospace' }}>
+      {/* top bar */}
+      <div className="pointer-events-auto absolute top-0 left-0 right-0 flex items-center gap-3 px-4 py-2"
+           style={{ background: 'rgba(10,14,26,0.88)', borderBottom: '1px solid #1e2d45' }}>
+        <span className="text-[10px] tracking-widest text-[#2563eb] uppercase">{roomName}</span>
+        <span className="text-[#1e2d45]">|</span>
 
-  // active selection: click takes priority over hover
-  const selected = clicked ?? hovered;
+        <div className="flex items-center gap-2">
+          <span className="text-[10px] text-[#64748b]">HP</span>
+          <div className="w-28 h-2 rounded-full" style={{ background: '#1e2d45' }}>
+            <div className="h-2 rounded-full transition-all duration-300"
+                 style={{
+                   width: `${hpPct}%`,
+                   background: hpPct > 50 ? '#22c55e' : hpPct > 25 ? '#f59e0b' : '#ef4444',
+                 }} />
+          </div>
+          <span className="text-[10px] text-[#94a3b8]">{player.hp}/{player.max_hp}</span>
+        </div>
 
-  function handleClick(id:number){
-    if(id===currentId||!adjacentIds.includes(id))return;
-    // toggle click lock
-    setClicked(prev=>prev===id?null:id);
-  }
+        <span className="text-[10px] text-[#f59e0b] ml-1">&#9670; {player.gold}g</span>
+        <span className="text-[10px] text-[#60a5fa]">Lv.{player.level}</span>
+        {active && <span className="text-[10px] text-[#a78bfa]">&#9889; {active.name}</span>}
 
-  function handleCancel(){
-    setClicked(null);
-    setHovered(null);
-  }
-
-  const dest = (selected!==null&&adjacentIds.includes(selected))
-    ? {id:selected,name:ROOM_NAMES[selected],dir:getTravelDir(currentId,selected)}
-    : null;
-
-  return(
-    <div className="flex-1 flex flex-col" style={{minHeight:0}}>
-      {/* breadcrumb */}
-      <div className="flex items-center justify-between mb-3 shrink-0">
-        <p className="text-[11px] text-[#64748b] uppercase tracking-widest">
-          <span className="text-[#334155]">World</span>
-          <span className="mx-2 text-[#1e2d45]">/</span>
-          <span className="text-[#60a5fa]">Adjacency Graph</span>
-        </p>
-        <div className="flex items-center gap-2 bg-[#0f1728] border border-[#1e2d45] rounded-lg px-3 py-1.5">
-          <span className="text-[#334155] text-xs">⌕</span>
-          <span className="text-[#334155] text-[11px]">Search Rooms…</span>
+        <div className="ml-auto flex gap-3">
+          <button className="pointer-events-auto text-[10px] text-[#475569] hover:text-[#94a3b8] transition-colors"
+                  onClick={onMap}>MAP</button>
+          <button className="pointer-events-auto text-[10px] text-[#475569] hover:text-[#ef4444] transition-colors"
+                  onClick={onLogout}>EXIT</button>
         </div>
       </div>
 
-      {/* map */}
-      <div className="relative flex-1 card-dark overflow-hidden" style={{minHeight:320}}>
-        <svg viewBox="0 0 700 430" className="w-full h-full" style={{minHeight:320}}>
-          {MAP_EDGES.map(([a,b],i)=>{
-            const pa=ROOM_POS[a],pb=ROOM_POS[b];
-            const live=(a===currentId||b===currentId);
-            return <line key={i} x1={pa.x} y1={pa.y} x2={pb.x} y2={pb.y}
-              stroke={live?"#1e3a5f":"#151f35"} strokeWidth={live?1.5:1}
-              strokeDasharray="6 4" opacity={live?.9:.45}/>;
-          })}
-          {ROOM_NAMES.map((_,id)=>{
-            const p=ROOM_POS[id], cur=id===currentId, adj=adjacentIds.includes(id);
-            const isClicked=id===clicked, isHovered=id===hovered&&!isClicked;
-            const sel=isClicked||isHovered;
-            return(
-              <g key={id} style={{cursor:adj?"pointer":"default"}}>
-                {cur&&<circle cx={p.x} cy={p.y} r="40" fill="none" stroke="#2563eb" strokeWidth="1" className="map-node-ring" style={{pointerEvents:"none"}}/>}
-                {isClicked&&<circle cx={p.x} cy={p.y} r={30} fill="none" stroke="#3b82f6" strokeWidth="1.5" strokeDasharray="4 3" className="map-node-ring" style={{pointerEvents:"none"}}/>}
-                <circle cx={p.x} cy={p.y} r={cur?28:adj?21:16}
-                  fill={cur?"#1e3a5f":isClicked?"#1a3060":isHovered?"#162540":"#0f1728"}
-                  stroke={cur?"#3b82f6":isClicked?"#60a5fa":isHovered?"#2563eb":adj?"#1e3a5f":"#151f35"}
-                  strokeWidth={cur?2.5:isClicked?2.5:isHovered?2:1.5}
-                  style={{pointerEvents:"none"}}/>
-                <text x={p.x} y={p.y+1} textAnchor="middle" dominantBaseline="middle"
-                  fontSize={cur?17:12}
-                  fill={cur?"#60a5fa":sel?"#93c5fd":adj?"#475569":"#2d3d55"}
-                  style={{pointerEvents:"none"}}>{ROOM_ICONS[id]}</text>
-                <text x={p.x} y={p.y+(cur?40:29)} textAnchor="middle"
-                  fontSize="9" fontFamily="ui-monospace,monospace" fontWeight={cur?"700":sel?"600":"400"}
-                  fill={cur?"#60a5fa":sel?"#93c5fd":adj?"#475569":"#2d3d55"}
-                  style={{pointerEvents:"none"}}>
-                  {ROOM_NAMES[id].toUpperCase()}
-                </text>
-                {/* fixed-size transparent hit area — never resizes, so no twitching */}
-                <circle cx={p.x} cy={p.y} r={44} fill="transparent" stroke="none"
-                  onClick={()=>handleClick(id)}
-                  onMouseEnter={()=>{if(adj&&!cur)setHovered(id);}}
-                  onMouseLeave={()=>setHovered(null)}/>
-              </g>
-            );
-          })}
-        </svg>
-        {/* zoom controls (decorative) */}
-        <div className="absolute bottom-4 left-4 flex flex-col gap-1.5">
-          {["+","−","⊙"].map(s=>(
-            <div key={s} className="card w-8 h-8 flex items-center justify-center text-[#64748b] text-sm hover:text-[#94a3b8] transition-colors cursor-pointer select-none">{s}</div>
+      {/* event log bottom-left */}
+      {events.length > 0 && (
+        <div className="absolute bottom-0 left-0 p-3 max-w-xs"
+             style={{ background: 'rgba(10,14,26,0.72)' }}>
+          {events.slice(-3).map((e, i, arr) => (
+            <p key={i} className="text-[10px] text-[#64748b] leading-relaxed"
+               style={{ opacity: 0.4 + 0.6 * ((i + 1) / arr.length) }}>
+              &rsaquo; {e}
+            </p>
           ))}
-        </div>
-      </div>
-
-      {/* travel panel */}
-      {dest?.dir&&(
-        <div className="card p-4 mt-3 border-[#1e3a5f]">
-          <div className="flex items-center justify-between mb-3">
-            <div>
-              <p className="text-[9px] text-[#64748b] uppercase tracking-widest mb-0.5">Destination</p>
-              <p className="text-blue-400 font-bold text-sm">{dest.name}</p>
-            </div>
-            <div className="text-right">
-              <p className="text-[9px] text-[#64748b] uppercase tracking-widest mb-0.5">Direction</p>
-              <p className="text-[#e2e8f0] font-bold text-sm">{dest.dir}</p>
-            </div>
-          </div>
-          <div className="flex gap-2">
-            <button className="btn-os btn-ghost-os flex-1 text-xs py-2" onClick={handleCancel}>Cancel</button>
-            <button className="btn-os btn-primary flex-1 text-xs py-2" disabled={busy}
-                    onClick={()=>{onTravel(dest.dir!);handleCancel();}}>
-              {busy?<Spinner/>:null} Initiate Travel
-            </button>
-          </div>
         </div>
       )}
 
-      <div className="flex items-center gap-4 mt-3 text-[10px] text-[#334155] shrink-0">
-        <span className="flex items-center gap-1.5"><span className="dot-green" style={{width:5,height:5}}/>System: Nominal</span>
-        <span>Grid Latency: 4ms</span>
-        <span className="ml-auto text-[#1e2d45]">ARC_OS v4.2.0 • STABLE</span>
+      {/* hints bottom-right */}
+      <div className="absolute bottom-2 right-3 text-[9px] text-[#1e3a5f] text-right space-y-px">
+        <div>WASD / Arrows &middot; Move</div>
+        <div>Walk into a door to travel &middot; E near &#9670; to shop</div>
       </div>
     </div>
   );
 }
 
-/* ──────────────────────────────────────── PlayerStatsView (ARCADIA OS) ── */
-function PlayerStatsView({gs,busy}:{gs:GameState;busy:boolean}){
-  const {player} = gs;
-  const hpPct    = player.max_hp>0?Math.round((player.hp/player.max_hp)*100):0;
-  const hpColor  = hpPct>60?"#22c55e":hpPct>30?"#f59e0b":"#ef4444";
-
-  const metrics = [
-    {label:"STRENGTH",   value:player.attack*5,  max:100, color:"#3b82f6",  desc:"Sub-dermal hydraulic reinforcements active."},
-    {label:"AGILITY",    value:Math.min(100,player.defense*7+22),max:100,color:"#22c55e",desc:"Synaptic response time: 0.04ms."},
-    {label:"INTELLIGENCE",value:Math.min(100,player.level*2+50), max:100,color:"#a855f7",desc:"Secondary processing core enabled."},
-  ] as const;
-
-  const neuralLinks = [
-    {icon:"👁",label:"Enhanced Optical Overlay",desc:"Project tactical data and enemy health bars directly onto the retina.",status:"ACTIVE",statusClass:"badge-green"},
-    {icon:"⚡",label:"Adrenaline Governor",     desc:"Reduces stamina drain by 25% during high-intensity combat encounters.",status:"PASSIVE",statusClass:"badge"},
-    {icon:"🔒",label:"Deep-Net Breach",         desc:"Requires Level 50. Bypass advanced security nodes from distance.",status:"LOCKED",statusClass:"badge-red",locked:true},
-  ];
-
-  return(
-    <div className="flex-1 flex flex-col gap-4">
-      {/* subject card */}
-      <div className="card p-5 flex items-center gap-5">
-        <div className="w-20 h-20 rounded-lg border-2 border-blue-500 bg-[#0f1728] flex items-center justify-center text-3xl flex-shrink-0 relative" style={{boxShadow:"0 0 16px rgba(59,130,246,.25)"}}>
-          {(player.username[0]??"T").toUpperCase()}
-          <span className="absolute bottom-1 right-1 w-3 h-3 rounded-full bg-green-400 border-2 border-[#0f1728]"/>
+/* ═══════════════════════════════════════════════════════════════════════
+   COMBAT OVERLAY
+═══════════════════════════════════════════════════════════════════════ */
+function CombatOverlay({
+  enemyName, player, events, busy, onAttack, onFlee,
+}: {
+  enemyName: string; player: PlayerInfo; events: string[];
+  busy: boolean; onAttack: () => void; onFlee: () => void;
+}) {
+  const hpPct = Math.max(0, player.hp / player.max_hp) * 100;
+  return (
+    <div className="absolute inset-0 flex items-center justify-center z-40"
+         style={{ background: 'rgba(0,0,0,0.84)', fontFamily: 'ui-monospace,monospace' }}>
+      <div className="w-96 rounded-2xl p-6 border" style={{ background: '#0d1520', borderColor: '#1e3a5f' }}>
+        <div className="text-center mb-5">
+          <p className="text-[10px] tracking-widest text-[#ef4444] uppercase mb-1">Combat Engaged</p>
+          <h2 className="text-xl font-bold text-white">{enemyName}</h2>
         </div>
-        <div className="flex-1">
-          <div className="flex items-center gap-3 mb-2">
-            <h2 className="text-xl font-bold text-[#e2e8f0]">Subject #{player.username}</h2>
-            <span className="badge">LEVEL {player.level} OPERATIVE</span>
+
+        <div className="mb-4">
+          <div className="flex justify-between text-[10px] text-[#64748b] mb-1">
+            <span>{player.username}</span>
+            <span>{player.hp} / {player.max_hp} HP</span>
           </div>
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-4">
-            {[
-              {label:"NEURAL SYNC",value:`${hpPct}.${(hpPct%10).toString().padStart(1,"0")}%`,color:"#60a5fa"},
-              {label:"CLASS",      value:"Infiltrator",   color:"#e2e8f0"},
-              {label:"REGION",     value:gs.location,    color:"#e2e8f0"},
-              {label:"KARMA",      value:player.gold>200?"Benevolent":player.gold>100?"Neutral":"Chaotic",color:"#fbbf24"},
-            ].map(r=>(
-              <div key={r.label}>
-                <p className="text-[10px] text-[#64748b] uppercase tracking-widest">{r.label}</p>
-                <p className="font-bold text-sm mt-0.5" style={{color:r.color}}>{r.value}</p>
-              </div>
-            ))}
+          <div className="h-3 rounded-full" style={{ background: '#1e2d45' }}>
+            <div className="h-3 rounded-full transition-all"
+                 style={{
+                   width: `${hpPct}%`,
+                   background: hpPct > 50 ? '#22c55e' : hpPct > 25 ? '#f59e0b' : '#ef4444',
+                 }} />
           </div>
+        </div>
+
+        <div className="rounded-lg p-3 mb-4 min-h-16 space-y-1"
+             style={{ background: '#0a0e1a', border: '1px solid #1e2d45' }}>
+          {events.slice(-4).map((e, i) => (
+            <p key={i} className="text-[10px] text-[#94a3b8] leading-relaxed">&rsaquo; {e}</p>
+          ))}
+          {busy && <p className="text-[10px] text-[#2563eb] animate-pulse">Calculating...</p>}
+        </div>
+
+        <div className="flex gap-3">
+          <button onClick={onAttack} disabled={busy}
+                  className="flex-1 py-3 rounded-lg font-bold text-sm tracking-widest uppercase transition-all"
+                  style={{ background: busy ? '#1e2d45' : '#dc2626', color: '#fff',
+                           cursor: busy ? 'not-allowed' : 'pointer', opacity: busy ? 0.6 : 1 }}>
+            Attack
+          </button>
+          <button onClick={onFlee} disabled={busy}
+                  className="flex-1 py-3 rounded-lg font-bold text-sm tracking-widest uppercase"
+                  style={{ background: '#1e2d45', color: '#94a3b8',
+                           cursor: busy ? 'not-allowed' : 'pointer', opacity: busy ? 0.6 : 1 }}>
+            Flee
+          </button>
         </div>
       </div>
+    </div>
+  );
+}
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 flex-1">
-        {/* Cognitive metrics */}
-        <div className="card p-5 flex flex-col gap-4">
-          <div className="flex items-center justify-between">
-            <p className="text-[10px] text-[#64748b] uppercase tracking-widest">⚙ Cognitive &amp; Physical Metrics</p>
-            <span className="badge-green text-[9px]">LIVE UPDATES</span>
+/* ═══════════════════════════════════════════════════════════════════════
+   SHOP OVERLAY
+═══════════════════════════════════════════════════════════════════════ */
+const RARITY_LABELS = ['', 'Common', 'Uncommon', 'Rare', 'Epic', 'Legendary'];
+const RARITY_COLORS = ['', '#94a3b8', '#4ade80', '#818cf8', '#f59e0b', '#f43f5e'];
+
+function ShopOverlay({
+  shop, player, busy, lastEvent, onBuy, onClose,
+}: {
+  shop: ItemInfo[]; player: PlayerInfo; busy: boolean;
+  lastEvent: string; onBuy: () => void; onClose: () => void;
+}) {
+  const top = shop[0];
+  const canBuy = !!top && player.gold >= top.value && !busy;
+  return (
+    <div className="absolute inset-0 flex items-center justify-center z-40"
+         style={{ background: 'rgba(0,0,0,0.84)', fontFamily: 'ui-monospace,monospace' }}>
+      <div className="w-96 rounded-2xl p-6 border" style={{ background: '#0d1520', borderColor: '#1e3a5f' }}>
+        <div className="flex items-center justify-between mb-5">
+          <div>
+            <p className="text-[10px] tracking-widest text-[#f59e0b] uppercase mb-0.5">Merchant</p>
+            <h2 className="text-lg font-bold text-white">Item Shop</h2>
           </div>
-          <div className="space-y-5">
-            {metrics.map(m=>{
-              const pct=Math.round((m.value/m.max)*100);
-              return(
-                <div key={m.label}>
-                  <div className="flex justify-between mb-1.5">
-                    <span className="text-xs font-bold text-[#94a3b8] tracking-widest">{m.label}</span>
-                    <span className="text-xs font-bold tabular-nums" style={{color:m.color}}>{m.value}<span className="text-[#334155]">/{m.max}</span></span>
-                  </div>
-                  <div className="bar-wrap">
-                    <div className="bar-fill" style={{width:pct+"%",background:m.color}}/>
-                  </div>
-                  <p className="text-[10px] text-[#475569] mt-1">{m.desc}</p>
-                </div>
-              );
-            })}
-          </div>
-          {/* HP */}
-          <div className="card-dark rounded-lg px-4 py-3 flex items-center justify-between gap-4">
-            <div>
-              <p className="text-[9px] text-[#64748b] uppercase tracking-widest mb-1">HP</p>
-              <div className="hp-bar-wrap w-32"><div className="hp-bar-fill" style={{width:hpPct+"%",background:hpColor}}/></div>
-            </div>
-            <span className="text-sm font-bold tabular-nums text-[#e2e8f0]">{player.hp}<span className="text-[#334155]">/{player.max_hp}</span></span>
+          <div className="text-right">
+            <p className="text-[10px] text-[#64748b]">Your gold</p>
+            <p className="text-[#f59e0b] font-bold">&#9670; {player.gold}</p>
           </div>
         </div>
 
-        {/* Neural links */}
-        <div className="card p-5 flex flex-col gap-4">
-          <div className="flex items-center justify-between">
-            <p className="text-[10px] text-[#64748b] uppercase tracking-widest">✦ Neural Links</p>
+        {top ? (
+          <div className="rounded-xl p-4 mb-3 border" style={{ background: '#0a0e1a', borderColor: '#1e3a5f' }}>
+            <div className="flex items-start justify-between">
+              <div>
+                <p className="text-white font-bold text-sm">{top.name}</p>
+                <p className="text-[10px] mt-0.5"
+                   style={{ color: RARITY_COLORS[top.rarity] ?? '#94a3b8' }}>
+                  {RARITY_LABELS[top.rarity] ?? 'Unknown'} Rarity
+                </p>
+              </div>
+              <span className="text-[#f59e0b] font-bold">&#9670; {top.value}</span>
+            </div>
           </div>
-          <div className="grid grid-cols-2 gap-3 flex-1">
-            {neuralLinks.map((nl,i)=>(
-              <div key={i} className={"neural-card"+(nl.locked?" opacity-60":"")}>
-                <div className="flex items-center justify-between">
-                  <span className="text-2xl">{nl.icon}</span>
-                  <span className={nl.statusClass}>{nl.status}</span>
-                </div>
-                <p className="text-xs font-bold text-[#e2e8f0] mt-1">{nl.label}</p>
-                <p className="text-[10px] text-[#64748b] leading-relaxed">{nl.desc}</p>
+        ) : (
+          <div className="rounded-xl p-4 mb-3 text-center text-[#475569] text-sm"
+               style={{ background: '#0a0e1a' }}>
+            Shop is empty
+          </div>
+        )}
+
+        {shop.length > 1 && (
+          <div className="rounded-lg overflow-hidden mb-3" style={{ border: '1px solid #1e2d45' }}>
+            {shop.slice(1, 5).map((it, i) => (
+              <div key={i} className="flex items-center justify-between px-3 py-2"
+                   style={{ borderBottom: i < Math.min(shop.length - 2, 3) ? '1px solid #0f1728' : 'none' }}>
+                <span className="text-[11px] text-[#64748b]">{it.name}</span>
+                <span className="text-[11px] text-[#475569]">&#9670; {it.value}</span>
               </div>
             ))}
-            <button className="neural-card-add" disabled={busy}>
-              <span className="text-2xl">⊕</span>
-              <span className="text-[11px] font-semibold uppercase tracking-widest">Install New Link</span>
+          </div>
+        )}
+
+        {lastEvent && <p className="text-[10px] text-[#22c55e] mb-3">&rsaquo; {lastEvent}</p>}
+
+        <div className="flex gap-3">
+          <button onClick={onBuy} disabled={!canBuy}
+                  className="flex-1 py-3 rounded-lg font-bold text-sm tracking-widest uppercase transition-all"
+                  style={{ background: canBuy ? '#d97706' : '#1e2d45', color: '#fff',
+                           cursor: canBuy ? 'pointer' : 'not-allowed', opacity: canBuy ? 1 : 0.5 }}>
+            {busy ? '...' : 'Buy Item'}
+          </button>
+          <button onClick={onClose}
+                  className="flex-1 py-3 rounded-lg font-bold text-sm tracking-widest uppercase"
+                  style={{ background: '#1e2d45', color: '#94a3b8', cursor: 'pointer' }}>
+            Leave
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   MINI-MAP OVERLAY
+═══════════════════════════════════════════════════════════════════════ */
+const MAP_POS = [
+  { id: 0, label: 'Entrance', icon: 'E', x: 40,  y: 90  },
+  { id: 1, label: 'Armory',   icon: 'A', x: 40,  y: 30  },
+  { id: 2, label: 'Library',  icon: 'L', x: 130, y: 90  },
+  { id: 3, label: 'Sanctum',  icon: 'S', x: 130, y: 30  },
+];
+const MAP_EDGES = [[0, 1], [0, 2], [1, 2], [2, 3]];
+
+function MapOverlay({ current, onClose }: { current: number; onClose: () => void }) {
+  return (
+    <div className="absolute inset-0 flex items-center justify-center z-40"
+         style={{ background: 'rgba(0,0,0,0.84)', fontFamily: 'ui-monospace,monospace' }}>
+      <div className="w-72 rounded-2xl p-6 border" style={{ background: '#0d1520', borderColor: '#1e3a5f' }}>
+        <div className="flex items-center justify-between mb-5">
+          <h2 className="text-sm font-bold tracking-widest text-white uppercase">World Map</h2>
+          <button onClick={onClose} className="text-[#64748b] hover:text-white text-xl leading-none">&#xd7;</button>
+        </div>
+
+        <svg viewBox="0 0 180 130" className="w-full" style={{ height: 130 }}>
+          {MAP_EDGES.map(([a, b], i) => {
+            const pa = MAP_POS[a], pb = MAP_POS[b];
+            return <line key={i} x1={pa.x} y1={pa.y} x2={pb.x} y2={pb.y}
+                         stroke="#1e3a5f" strokeWidth={1.5} strokeDasharray="4 3" />;
+          })}
+          {MAP_POS.map(p => (
+            <g key={p.id}>
+              {p.id === current && (
+                <circle cx={p.x} cy={p.y} r={16} fill="none"
+                        stroke="#2563eb" strokeWidth={1.5} opacity={0.5} />
+              )}
+              <circle cx={p.x} cy={p.y} r={11}
+                      fill={p.id === current ? '#1e3a5f' : '#111827'}
+                      stroke={p.id === current ? '#3b82f6' : '#1e2d45'} strokeWidth={1.5} />
+              <text x={p.x} y={p.y + 4} textAnchor="middle" fontSize="9"
+                    fontFamily="ui-monospace,monospace"
+                    fill={p.id === current ? '#60a5fa' : '#475569'}>{p.icon}</text>
+              <text x={p.x} y={p.y + 22} textAnchor="middle" fontSize="7"
+                    fontFamily="ui-monospace,monospace"
+                    fill={p.id === current ? '#93c5fd' : '#334155'}>{p.label}</text>
+            </g>
+          ))}
+        </svg>
+
+        <button onClick={onClose}
+                className="w-full py-2 rounded-lg text-sm transition-colors"
+                style={{ background: '#1e2d45', color: '#64748b' }}>
+          Back to Game
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════════════════
+   MAIN GAME CANVAS COMPONENT
+═══════════════════════════════════════════════════════════════════════ */
+function ArcadiaGame({ initialGs, username }: { initialGs: ApiResult; username: string }) {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+
+  /* mutable world (game-loop owned, never trigger re-render) */
+  const W = useRef({
+    px:       9.5 * TILE,
+    py:       6.5 * TILE,
+    enemies:  spawnEnemies(0),
+    shops:    buildShopNpcs(0),
+    roomId:   (initialGs._state as { room_id?: number }).room_id ?? 0,
+    keys:     new Set<string>(),
+    paused:   false,
+    cooldown: 0,
+    frame:    0,
+    animId:   0,
+    apiState: initialGs._state,
+  });
+
+  /* react state driving HUD + overlays */
+  const [gs,        setGs]        = useState<ApiResult>(initialGs);
+  const [overlay,   setOverlay]   = useState<Overlay>('none');
+  const [fightName, setFightName] = useState('');
+  const [busy,      setBusy]      = useState(false);
+  const [shopTxt,   setShopTxt]   = useState('');
+
+  /* keep overlay ref in sync so game loop can read it without stale closure */
+  const overlayRef = useRef<Overlay>('none');
+  useEffect(() => {
+    overlayRef.current = overlay;
+    W.current.paused   = overlay !== 'none';
+  }, [overlay]);
+
+  /* ── combat ── */
+  const handleAttack = useCallback(async () => {
+    setBusy(true);
+    const res = await callApi('combat', W.current.apiState);
+    W.current.apiState = res._state;
+    setGs(res);
+    setBusy(false);
+
+    if (res.player.hp <= 0) { setOverlay('none'); return; }
+
+    const last = res.events[res.events.length - 1] ?? '';
+    if (/defeat|fled|victory/i.test(last)) {
+      /* mark this enemy as dead in the world */
+      const en = W.current.enemies.find(e => e.alive && e.name === fightName);
+      if (en) en.alive = false;
+      setOverlay('none');
+      W.current.cooldown = 90;
+    }
+  }, [fightName]);
+
+  const handleFlee = useCallback(() => {
+    setOverlay('none');
+    W.current.cooldown = 180;
+  }, []);
+
+  /* ── shop ── */
+  const handleBuy = useCallback(async () => {
+    setBusy(true);
+    const res = await callApi('buy', W.current.apiState);
+    W.current.apiState = res._state;
+    setGs(res);
+    setShopTxt(res.events[res.events.length - 1] ?? '');
+    setBusy(false);
+  }, []);
+
+  /* ── room travel ── */
+  const doTravel = useCallback(async (dir: string, dest: number, sx: number, sy: number) => {
+    if (W.current.paused) return;
+    W.current.paused = true;
+    const res = await callApi('move', W.current.apiState, [dir]);
+    W.current.apiState = res._state;
+    W.current.roomId   = dest;
+    W.current.px       = sx;
+    W.current.py       = sy;
+    W.current.enemies  = spawnEnemies(dest);
+    W.current.shops    = buildShopNpcs(dest);
+    W.current.cooldown = 90;
+    setGs(res);
+    W.current.paused = overlayRef.current !== 'none';
+  }, []);
+
+  /* ── logout ── */
+  const handleLogout = useCallback(() => {
+    localStorage.removeItem(`arcadia_${username}`);
+    window.location.reload();
+  }, [username]);
+
+  /* ════════════════════════════════ GAME LOOP ════════════════════════════ */
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d')!;
+
+    /* key handlers */
+    function onKeyDown(e: KeyboardEvent) {
+      W.current.keys.add(e.key);
+      if (!W.current.paused && (e.key === 'e' || e.key === 'E')) {
+        for (const npc of W.current.shops) {
+          if (dist2d(W.current.px, W.current.py, npc.x, npc.y) < 80) {
+            setShopTxt('');
+            setOverlay('shop');
+            break;
+          }
+        }
+      }
+    }
+    function onKeyUp(e: KeyboardEvent) { W.current.keys.delete(e.key); }
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('keyup',   onKeyUp);
+
+    function tick(frame: number) {
+      W.current.animId = requestAnimationFrame(() => tick(frame + 1));
+      W.current.frame  = frame;
+      const w   = W.current;
+      const map = ROOM_MAPS[w.roomId];
+      const th  = THEMES[w.roomId];
+
+      /* ─── update ─── */
+      if (!w.paused) {
+        if (w.cooldown > 0) w.cooldown--;
+
+        /* movement */
+        const k = w.keys;
+        let dx = 0, dy = 0;
+        if (k.has('w') || k.has('W') || k.has('ArrowUp'))    dy -= PL_SPD;
+        if (k.has('s') || k.has('S') || k.has('ArrowDown'))  dy += PL_SPD;
+        if (k.has('a') || k.has('A') || k.has('ArrowLeft'))  dx -= PL_SPD;
+        if (k.has('d') || k.has('D') || k.has('ArrowRight')) dx += PL_SPD;
+
+        const cr = PL_R - 2;  /* collision radius (slightly smaller for feel) */
+
+        if (dx !== 0) {
+          const tx = w.px + dx + (dx > 0 ? cr : -cr);
+          if (!isDoorTile(tileAt(map, tx, w.py - cr)) && tileAt(map, tx, w.py - cr) !== WALL &&
+              !isDoorTile(tileAt(map, tx, w.py + cr)) && tileAt(map, tx, w.py + cr) !== WALL) {
+            w.px += dx;
+          } else if (isDoorTile(tileAt(map, tx, w.py))) {
+            w.px += dx;  /* allow walking into door tiles */
+          }
+        }
+        if (dy !== 0) {
+          const ty = w.py + dy + (dy > 0 ? cr : -cr);
+          if (!isDoorTile(tileAt(map, w.px - cr, ty)) && tileAt(map, w.px - cr, ty) !== WALL &&
+              !isDoorTile(tileAt(map, w.px + cr, ty)) && tileAt(map, w.px + cr, ty) !== WALL) {
+            w.py += dy;
+          } else if (isDoorTile(tileAt(map, w.px, ty))) {
+            w.py += dy;
+          }
+        }
+
+        w.px = Math.max(PL_R, Math.min(CW - PL_R, w.px));
+        w.py = Math.max(PL_R, Math.min(CH - PL_R, w.py));
+
+        /* door transition */
+        const pt = tileAt(map, w.px, w.py);
+        if (isDoorTile(pt) && w.cooldown === 0) {
+          for (const exit of ROOM_EXITS[w.roomId]) {
+            if (exit.tile === pt) {
+              w.cooldown = 999; /* prevent re-triggering while async travels */
+              void doTravel(exit.dir, exit.destRoom, exit.spawnX, exit.spawnY);
+              break;
+            }
+          }
+        }
+
+        /* enemy wander + combat trigger */
+        for (const en of w.enemies) {
+          if (!en.alive) continue;
+
+          en.wanderTimer--;
+          if (en.wanderTimer <= 0) {
+            const angle = Math.random() * Math.PI * 2;
+            en.vx = Math.cos(angle) * EN_SPD;
+            en.vy = Math.sin(angle) * EN_SPD;
+            en.wanderTimer = 60 + Math.random() * 120;
+          }
+
+          /* enemy collision with walls */
+          const ex2 = en.x + en.vx, ey2 = en.y + en.vy;
+          const er = EN_R - 2;
+          if (tileAt(map, ex2 + er, en.y) !== WALL && tileAt(map, ex2 - er, en.y) !== WALL)
+            en.x += en.vx; else en.vx *= -1;
+          if (tileAt(map, en.x, ey2 + er) !== WALL && tileAt(map, en.x, ey2 - er) !== WALL)
+            en.y += en.vy; else en.vy *= -1;
+
+          en.x = Math.max(TILE + EN_R, Math.min(CW - TILE - EN_R, en.x));
+          en.y = Math.max(TILE + EN_R, Math.min(CH - TILE - EN_R, en.y));
+
+          /* player vs enemy */
+          if (w.cooldown === 0 && dist2d(w.px, w.py, en.x, en.y) < PL_R + EN_R + 2) {
+            w.cooldown = 120;
+            setFightName(en.name);
+            setOverlay('combat');
+          }
+        }
+      }
+
+      /* ─── draw ─── */
+      drawRoom(ctx, map, th, frame);
+
+      /* shop NPCs */
+      for (const npc of w.shops) drawShopNpc(ctx, npc, frame);
+
+      /* enemies */
+      for (const en of w.enemies) {
+        if (!en.alive) continue;
+        drawGlowCircle(ctx, en.x, en.y, EN_R, en.col, en.col, en.name);
+        /* eye */
+        ctx.fillStyle = '#fff';
+        ctx.beginPath(); ctx.arc(en.x, en.y - 4, 3, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = '#000';
+        ctx.beginPath(); ctx.arc(en.x, en.y - 4, 1.5, 0, Math.PI * 2); ctx.fill();
+      }
+
+      /* player */
+      drawPlayer(ctx, w.px, w.py, th);
+
+      /* room name watermark */
+      ctx.save();
+      ctx.fillStyle = 'rgba(255,255,255,0.035)';
+      ctx.font = 'bold 52px ui-monospace,monospace';
+      ctx.textAlign = 'center';
+      ctx.fillText(th.name.toUpperCase(), CW / 2, CH / 2 + 18);
+      ctx.restore();
+    }
+
+    W.current.animId = requestAnimationFrame(() => tick(0));
+    return () => {
+      cancelAnimationFrame(W.current.animId);
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('keyup',   onKeyUp);
+    };
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const dead = gs.player.hp <= 0;
+
+  return (
+    <div className="min-h-screen flex items-center justify-center" style={{ background: '#000' }}>
+      <div className="relative shadow-2xl" style={{ width: CW, height: CH }}>
+        <canvas ref={canvasRef} width={CW} height={CH} className="block"
+                style={{ imageRendering: 'pixelated' }} />
+
+        {/* HUD */}
+        {!dead && (
+          <Hud
+            player={gs.player}
+            roomName={THEMES[W.current.roomId]?.name ?? gs.location}
+            events={gs.events}
+            skills={gs.skills}
+            onMap={() => setOverlay('map')}
+            onLogout={handleLogout}
+          />
+        )}
+
+        {/* GAME OVER */}
+        {dead && (
+          <div className="absolute inset-0 flex flex-col items-center justify-center z-50"
+               style={{ background: 'rgba(0,0,0,0.92)', fontFamily: 'ui-monospace,monospace' }}>
+            <p className="text-[10px] tracking-widest text-[#ef4444] uppercase mb-3">Connection Lost</p>
+            <h2 className="text-4xl font-black text-white mb-2">YOU FELL</h2>
+            <p className="text-[#475569] text-sm mb-8">{gs.player.username} has been defeated.</p>
+            <button onClick={handleLogout}
+                    className="px-8 py-3 rounded-lg font-bold tracking-widest uppercase text-white text-sm"
+                    style={{ background: '#dc2626', cursor: 'pointer' }}>
+              Restart
             </button>
           </div>
-        </div>
-      </div>
-    </div>
-  );
-}
+        )}
 
-/* ──────────────────────────────────────────── Activity Log view ── */
-function ActivityLogView({gs,dispatch,busy}:{gs:GameState;dispatch:(c:string,a?:string[])=>void;busy:boolean}){
-  const {player} = gs;
-  const hpPct    = player.max_hp>0?Math.round((player.hp/player.max_hp)*100):0;
-  const active   = gs.skills.find(s=>s.active);
+        {/* COMBAT */}
+        {overlay === 'combat' && (
+          <CombatOverlay
+            enemyName={fightName} player={gs.player}
+            events={gs.events} busy={busy}
+            onAttack={handleAttack} onFlee={handleFlee}
+          />
+        )}
 
-  const evtIcons = (ev:string)=>{
-    if(ev.startsWith("Victory")||ev.includes("defeated"))return{icon:"✓",bg:"bg-green-500"};
-    if(ev.includes("fallen")||ev.includes("claws"))      return{icon:"⚠",bg:"bg-red-500"};
-    if(ev.includes("Traveled"))                          return{icon:"→",bg:"bg-blue-500"};
-    if(ev.includes("Purchased"))                         return{icon:"◈",bg:"bg-purple-500"};
-    if(ev.includes("skill")||ev.includes("Learned"))     return{icon:"⚡",bg:"bg-yellow-500"};
-    return{icon:"●",bg:"bg-[#334155]"};
-  };
+        {/* SHOP */}
+        {overlay === 'shop' && (
+          <ShopOverlay
+            shop={gs.shop} player={gs.player}
+            busy={busy} lastEvent={shopTxt}
+            onBuy={handleBuy} onClose={() => setOverlay('none')}
+          />
+        )}
 
-  return(
-    <div className="flex-1 flex gap-4">
-      {/* feed */}
-      <div className="flex-1 flex flex-col gap-4">
-        <div className="flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <p className="text-sm font-bold text-[#e2e8f0]">Recent Buffer Records</p>
-            <span className="badge-green flex items-center gap-1.5"><span className="live-dot"/>LIVE FEED</span>
-          </div>
-          <div className="flex gap-1">
-            {["All","Combat","Loot","Milestones"].map(t=>(
-              <button key={t} className={"btn-os py-1 px-3 text-[10px] "+(t==="All"?"btn-primary":"btn-ghost-os")} disabled>{t}</button>
-            ))}
-          </div>
-        </div>
-
-        {gs.events.length===0
-          ? <div className="card-dark rounded-lg p-6 text-center text-[#334155] text-sm">No recent activity.</div>
-          : <div className="space-y-2">
-              {[...gs.events].reverse().map((ev,i)=>{
-                const {icon,bg}=evtIcons(ev);
-                const ago=["2M","6M","13M","1H","8H"];
-                return(
-                  <div key={i} className="evt-card">
-                    <div className={`w-8 h-8 rounded-full ${bg} flex items-center justify-center text-white text-sm flex-shrink-0`}>{icon}</div>
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-center justify-between gap-2">
-                        <p className="text-[#e2e8f0] text-sm font-semibold truncate">{ev}</p>
-                        <span className="badge text-[9px] shrink-0">{ago[i]??""} AGO</span>
-                      </div>
-                      {ev.includes("Victory")&&<p className="text-[11px] text-[#64748b] mt-1">⚡ +{player.gold}g &nbsp;❤ {player.hp} HP</p>}
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
-        }
-        <button className="btn-os btn-ghost-os w-full text-xs py-2.5 mt-auto">↓ Load Older History</button>
-      </div>
-
-      {/* right panel */}
-      <div className="w-60 shrink-0 flex flex-col gap-4">
-        {/* session summary */}
-        <div className="card p-4">
-          <p className="text-[10px] text-[#64748b] uppercase tracking-widest mb-3">⊡ Session Summary</p>
-          {[
-            {label:"Time Played",   value:"2h 45m",        color:"text-[#e2e8f0]"},
-            {label:"Total XP Gained",value:"+"+player.gold*148,color:"text-green-400"},
-            {label:"Enemies Slain", value:String(player.level*3), color:"text-[#e2e8f0]"},
-            {label:"Rare Items",    value:String(gs.inventory.filter(x=>x.rarity>=3).length), color:"text-blue-400"},
-          ].map(r=>(
-            <div key={r.label} className="flex justify-between py-2 border-b border-[#1a2a3f] last:border-0">
-              <span className="text-[11px] text-[#64748b]">{r.label}</span>
-              <span className={"text-[11px] font-bold "+r.color}>{r.value}</span>
-            </div>
-          ))}
-          <div className="mt-3 flex gap-1">
-            {[["#22c55e","COMBAT"],["#f59e0b","LOOT"],["#a855f7","LEVEL"]].map(([c,l])=>(
-              <div key={l} className="flex-1 text-center">
-                <div className="h-1.5 rounded-full mb-1" style={{background:c}}/>
-                <p className="text-[8px] text-[#334155] uppercase">{l}</p>
-              </div>
-            ))}
-          </div>
-        </div>
-
-        {/* combat button */}
-        <div className="card p-4 flex flex-col gap-3">
-          <p className="text-[10px] text-[#64748b] uppercase tracking-widest">⚔ Combat</p>
-          {active&&(
-            <div className="card-dark rounded-lg px-3 py-2 flex items-center justify-between">
-              <span className="text-[10px] text-blue-400">Active:</span>
-              <span className="text-[11px] font-bold text-[#e2e8f0]">{active.name}</span>
-              <span className="text-[10px] text-[#64748b]">{active.power} PWR</span>
-            </div>
-          )}
-          <div className="bar-wrap-sm">
-            <div className="bar-fill" style={{width:hpPct+"%",background:hpPct>60?"#22c55e":hpPct>30?"#f59e0b":"#ef4444"}}/>
-          </div>
-          <p className="text-[10px] text-[#334155]">HP: {player.hp}/{player.max_hp}</p>
-          <button className="btn-os btn-danger w-full py-2.5" disabled={busy} onClick={()=>dispatch("combat")}>
-            {busy?<><Spinner/><span>Processing…</span></>:<span>⚔ Engage Combat</span>}
-          </button>
-          <button className="btn-os btn-secondary w-full text-xs py-2" disabled={busy||gs.skills.length===0} onClick={()=>dispatch("skill",["rotate"])}>⟳ Rotate Skill</button>
-        </div>
-
-        {/* upgrade hint */}
-        {gs.shop.length>0&&(
-          <div className="card p-4 flex flex-col gap-2 border-[#1e3a5f]" style={{background:"rgba(30,58,95,.15)"}}>
-            <p className="text-[10px] text-[#64748b] uppercase tracking-widest">Upgrade Hint</p>
-            <p className="text-[11px] text-[#94a3b8]">Best available: <span className="text-[#60a5fa] font-bold">{gs.shop[0].name}</span></p>
-            <p className="text-[10px] text-[#64748b]">{RARITY_NAME[gs.shop[0].rarity]??""} · {gs.shop[0].value}g</p>
-          </div>
+        {/* MAP */}
+        {overlay === 'map' && (
+          <MapOverlay current={W.current.roomId} onClose={() => setOverlay('none')} />
         )}
       </div>
     </div>
   );
 }
 
-/* ──────────────────────────────────────────── QuestsView ── */
-function QuestsView({gs,dispatch,busy}:{gs:GameState;dispatch:(c:string,a?:string[])=>void;busy:boolean}){
-  const active=gs.skills.find(s=>s.active);
-  return(
-    <div className="flex-1 grid grid-cols-1 lg:grid-cols-2 gap-4">
-      {/* quests */}
-      <div className="card p-5 flex flex-col gap-4">
-        <p className="text-[10px] text-[#64748b] uppercase tracking-widest">Active Quests</p>
-        {gs.quests.length===0
-          ?<p className="text-[#334155] text-sm">No active quests.</p>
-          :<ul className="space-y-3">
-            {gs.quests.map((q,i)=>(
-              <li key={i} className="border-l-2 border-blue-800 pl-3">
-                <p className="text-[#e2e8f0] text-sm font-semibold">{q.title}</p>
-                <p className="text-[#64748b] text-xs mt-0.5">{q.description}</p>
-              </li>
-            ))}
-          </ul>
-        }
-      </div>
+/* ═══════════════════════════════════════════════════════════════════════
+   ROOT
+═══════════════════════════════════════════════════════════════════════ */
+export default function Page() {
+  const [screen,  setScreen]  = useState<'login' | 'game'>('login');
+  const [initGs,  setInitGs]  = useState<ApiResult | null>(null);
+  const [uname,   setUname]   = useState('');
 
-      {/* skills + combat */}
-      <div className="flex flex-col gap-4">
-        <div className="card p-5 flex flex-col gap-3">
-          <p className="text-[10px] text-[#64748b] uppercase tracking-widest">Skill Ring</p>
-          <ul className="space-y-1.5">
-            {gs.skills.map((s,i)=>(
-              <li key={i} className={"flex items-center justify-between rounded-md px-3 py-2 text-sm "+(s.active?"bg-blue-900/30 border border-blue-800/50 text-blue-300":"text-[#475569]")}>
-                <span className="flex items-center gap-2">{s.active&&<span className="text-blue-400 text-xs">▶</span>}{s.name}</span>
-                <span className="text-xs tabular-nums">{s.power} PWR</span>
-              </li>
-            ))}
-          </ul>
-          <button className="btn-os btn-secondary w-full text-xs py-2" disabled={busy||gs.skills.length===0} onClick={()=>dispatch("skill",["rotate"])}>⟳ Rotate Skill</button>
-        </div>
-        <div className="card p-5 flex flex-col gap-3">
-          <p className="text-[10px] text-[#64748b] uppercase tracking-widest">Combat</p>
-          {active&&<div className="flex items-center gap-2 p-2 card-dark rounded-md"><span className="text-blue-400 text-xs">Active:</span><span className="text-[#e2e8f0] text-sm font-semibold">{active.name}</span><span className="text-[#64748b] text-xs ml-auto">{active.power} PWR</span></div>}
-          <button className="btn-os btn-danger w-full py-3" disabled={busy} onClick={()=>dispatch("combat")}>
-            {busy?<><Spinner/><span>Processing…</span></>:<span>⚔ Engage Combat</span>}
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-}
+  const handleLogin = useCallback(async (u: string) => {
+    const key = `arcadia_${u}`;
+    let res: ApiResult;
+    try {
+      const saved = localStorage.getItem(key);
+      res = saved ? (JSON.parse(saved) as ApiResult) : await callApi('init', null, [], u);
+    } catch {
+      res = await callApi('init', null, [], u);
+    }
+    localStorage.setItem(key, JSON.stringify(res));
+    setUname(u);
+    setInitGs(res);
+    setScreen('game');
+  }, []);
 
-/* ──────────────────────────────────────────── InventoryView ── */
-function InventoryView({gs,dispatch,busy}:{gs:GameState;dispatch:(c:string,a?:string[])=>void;busy:boolean}){
-  return(
-    <div className="flex-1 grid grid-cols-1 lg:grid-cols-2 gap-4">
-      {/* inventory */}
-      <div className="card p-5 flex flex-col gap-4">
-        <p className="text-[10px] text-[#64748b] uppercase tracking-widest">Inventory ({gs.inventory.length})</p>
-        {gs.inventory.length===0
-          ?<p className="text-[#334155] text-sm">Empty.</p>
-          :<ul className="space-y-2 overflow-y-auto" style={{maxHeight:380}}>
-            {gs.inventory.map((item,i)=>(
-              <li key={i} className="flex items-center justify-between card-dark rounded-lg px-3 py-2.5">
-                <div>
-                  <p className="text-[#e2e8f0] text-sm font-semibold">{item.name}</p>
-                  <p className={"text-[10px] mt-0.5 "+(RARITY_CLASS[item.rarity]??"r-common")}>{RARITY_NAME[item.rarity]??""}</p>
-                </div>
-                <span className="text-[#64748b] text-xs tabular-nums">{item.value}g</span>
-              </li>
-            ))}
-          </ul>
-        }
-      </div>
-
-      {/* shop */}
-      <div className="card p-5 flex flex-col gap-4">
-        <div className="flex items-center justify-between">
-          <p className="text-[10px] text-[#64748b] uppercase tracking-widest">Shop — Max Heap</p>
-          <button className="btn-os btn-primary text-xs py-1.5 px-4" disabled={busy||gs.shop.length===0} onClick={()=>dispatch("buy")}>Buy Best</button>
-        </div>
-        {gs.shop.length===0
-          ?<p className="text-[#334155] text-sm">Shop is empty.</p>
-          :<ul className="space-y-2">
-            {gs.shop.map((item,i)=>(
-              <li key={i} className={"flex items-center justify-between rounded-lg px-3 py-2.5 "+(i===0?"bg-blue-900/20 border border-blue-800/40":"card-dark")}>
-                <div>
-                  <div className="flex items-center gap-1.5">{i===0&&<span className="text-yellow-400 text-[10px]">★</span>}<p className="text-[#e2e8f0] text-sm">{item.name}</p></div>
-                  <p className={"text-[10px] mt-0.5 "+(RARITY_CLASS[item.rarity]??"r-common")}>{RARITY_NAME[item.rarity]??""}</p>
-                </div>
-                <span className="text-[#64748b] text-xs">{item.value}g</span>
-              </li>
-            ))}
-          </ul>
-        }
-      </div>
-    </div>
-  );
-}
-
-/* ──────────────────────────────────────── Leaderboard view ── */
-function LeaderboardView({gs}:{gs:GameState}){
-  const fakeRows = [
-    {rank:1,name:"ZeroIndex_00",id:"88219",level:99,score:14205,wr:98.2},
-    {rank:2,name:"Logarithm_X", id:"44012",level:92,score:12880,wr:94.5},
-    {rank:3,name:"BinarySearcher",id:"12998",level:88,score:11450,wr:92.1},
-    {rank:4,name:"PivotElement",id:"33120",level:85,score:9940, wr:89.9},
-    {rank:5,name:"DivideAndConquer",id:"77102",level:81,score:8200,wr:85.4},
-  ];
-  const rankClass=(r:number)=>r===1?"rank-gold":r===2?"rank-silver":r===3?"rank-bronze":"rank-default";
-
-  const [filter,setFilter]=useState<"all"|"season">("season");
-
-  return(
-    <div className="flex-1 flex flex-col gap-4">
-      {/* header */}
-      <div className="flex items-center justify-between">
-        <div>
-          <h2 className="text-2xl font-bold text-[#e2e8f0]">Global Rankings</h2>
-          <p className="text-[11px] text-[#64748b] flex items-center gap-1.5 mt-0.5"><span className="text-blue-400">⚡</span>Optimized by Binary Search Algorithm for real-time sorting</p>
-        </div>
-        <div className="flex gap-2">
-          <button className={"btn-os py-2 px-4 text-xs "+(filter==="all"?"btn-secondary":"btn-primary")}   onClick={()=>setFilter("all")}>All Time</button>
-          <button className={"btn-os py-2 px-4 text-xs "+(filter==="season"?"btn-primary":"btn-secondary")} onClick={()=>setFilter("season")}>Season 12</button>
-        </div>
-      </div>
-
-      {/* search */}
-      <div className="flex items-center gap-3 card-dark rounded-lg px-4 py-3">
-        <span className="text-[#334155]">⌕</span>
-        <span className="text-[#334155] text-sm flex-1">Binary Search: [Low, High] indexing for player name…</span>
-        <span className="badge text-[9px]">CMD + K</span>
-      </div>
-
-      {/* table */}
-      <div className="card overflow-hidden">
-        <div className="grid text-[10px] text-[#64748b] uppercase tracking-wider px-5 py-3 border-b border-[#1e2d45]"
-             style={{gridTemplateColumns:"60px 1fr 110px 160px 100px"}}>
-          <span>Rank</span><span>Player Name</span><span>Level</span><span>Achievement Score</span><span>Win Rate</span>
-        </div>
-        {fakeRows.map(row=>(
-          <div key={row.rank} className="grid items-center px-5 py-4 border-b border-[#1a2a3f] last:border-0 hover:bg-[#111827] transition-colors"
-               style={{gridTemplateColumns:"60px 1fr 110px 160px 100px"}}>
-            <span className={"w-8 h-8 rounded-full flex items-center justify-center text-sm font-bold "+rankClass(row.rank)}>{row.rank}</span>
-            <div className="flex items-center gap-3">
-              <div className="w-8 h-8 rounded-full bg-[#0f1728] border border-[#1e2d45] flex items-center justify-center text-sm">
-                {row.name[0]}
-              </div>
-              <div>
-                <p className="text-[#e2e8f0] text-sm font-semibold">{row.name}</p>
-                <p className="text-[#334155] text-[10px]">ID: #{row.id}</p>
-              </div>
-            </div>
-            <span className="text-blue-400 text-sm font-bold">Level {row.level}</span>
-            <span className="flex items-center gap-1.5 text-sm font-bold text-[#e2e8f0]">
-              <span className="text-blue-400 text-xs">●</span>{row.score.toLocaleString()}
-            </span>
-            <span className="text-[#e2e8f0] text-sm">{row.wr}%</span>
-          </div>
-        ))}
-      </div>
-
-      {/* you */}
-      <div className="card-dark rounded-lg px-5 py-3 flex items-center gap-4 border border-blue-800/30">
-        <span className="badge-blue">You</span>
-        <span className="text-[#e2e8f0] text-sm font-bold">{gs.player.username}</span>
-        <span className="text-[#64748b] text-xs">Level {gs.player.level}</span>
-        <span className="text-[#64748b] text-xs ml-auto">Score: {gs.player.gold*100}</span>
-      </div>
-
-      <div className="text-[10px] text-center text-[#334155]">
-        Showing 1–5 of 24,052 players &nbsp;•&nbsp; Algorithm: Binary Search O(log n) &nbsp;•&nbsp; Last Sorted: just now
-      </div>
-    </div>
-  );
-}
-
-/* ──────────────────────────────────────────────── Main game ── */
-export default function ArcadiaGame(){
-  const [username,setUsername] = useState<string|null>(null);
-  const [gs,setGs]             = useState<GameState|null>(null);
-  const [busy,setBusy]         = useState(false);
-  const [screenFlash,setScreenFlash] = useState(false);
-  const [activeTab,setActiveTab]     = useState<"map"|"log"|"quests"|"inventory"|"leaderboard"|"rankings">("map");
-  const logRef = useRef<HTMLDivElement>(null);
-
-  useEffect(()=>{if(logRef.current)logRef.current.scrollTop=logRef.current.scrollHeight;},[gs?.events]);
-
-  const dispatch = useCallback(async(command:string,args:string[]=[])=>{
-    if(!username||busy)return;
-    setBusy(true);
-    try{
-      const next=await callGame(command,username,args,gs?._state as Record<string,unknown>|undefined);
-      setGs(next);
-      if(command==="combat"){setScreenFlash(true);setTimeout(()=>setScreenFlash(false),500);}
-      try{localStorage.setItem("arcadia_"+username,JSON.stringify(next));}catch{/* ok */}
-    }catch{/* ok */}
-    finally{setBusy(false);}
-  },[username,busy,gs]);
-
-  function handleLogin(name:string){
-    setUsername(name);
-    try{
-      const s=localStorage.getItem("arcadia_"+name);
-      if(s){const p=JSON.parse(s) as GameState;if(p?.player){setGs(p);return;}}
-    }catch{/* ok */}
-    setBusy(true);
-    callGame("init",name)
-      .then(s=>{setGs(s);try{localStorage.setItem("arcadia_"+name,JSON.stringify(s));}catch{/* ok */}})
-      .finally(()=>setBusy(false));
+  if (screen === 'game' && initGs) {
+    return <ArcadiaGame initialGs={initGs} username={uname} />;
   }
-
-  if(!username)return <LoginScreen onLogin={handleLogin}/>;
-  if(!gs)return(
-    <div className="min-h-screen bg-[#0a0e1a] flex items-center justify-center" style={{fontFamily:"ui-monospace,monospace"}}>
-      <div className="flex items-center gap-3 text-[#64748b] text-sm"><Spinner/><span>Loading world data…</span></div>
-    </div>
-  );
-
-  const {player,location} = gs;
-  const hpPct    = player.max_hp>0?Math.round((player.hp/player.max_hp)*100):0;
-  const hpColor  = hpPct>60?"#22c55e":hpPct>30?"#f59e0b":"#ef4444";
-  const xpPct    = Math.min(100,((player.level-1)/99)*100);
-  const currentRoomId = getRoomId(location);
-
-  const TABS:[string,typeof activeTab][] = [
-    ["Map",         "map"],
-    ["Player",      "log"],
-    ["Activity Log","leaderboard"],
-    ["Rankings",    "rankings"],
-    ["Quests",      "quests"],
-    ["Inventory",   "inventory"],
-  ];
-
-  return(
-    <div className="min-h-screen bg-[#0a0e1a] flex flex-col select-none" style={{fontFamily:"ui-monospace,monospace"}}>
-      {screenFlash&&<div className="screen-flash"/>}
-
-      {/* ── top header ── */}
-      <header className="flex items-center justify-between px-5 py-3 border-b border-[#1e2d45] shrink-0 bg-[#0d1117]">
-        <div className="flex items-center gap-3">
-          <div className="w-6 h-6 rounded bg-blue-600 flex items-center justify-center font-black text-white text-xs">A</div>
-          <span className="font-bold text-sm text-[#e2e8f0] tracking-wider">ARCADIA TERMINAL</span>
-        </div>
-        <nav className="flex items-center gap-1 sm:gap-5">
-          {TABS.map(([label,tab])=>(
-            <button key={tab} onClick={()=>setActiveTab(tab)} className={"nav-tab"+(activeTab===tab?" active":"")}>
-              {label}
-            </button>
-          ))}
-          <div className="w-7 h-7 rounded-md card flex items-center justify-center text-[#64748b] hover:text-[#94a3b8] transition-colors cursor-pointer text-sm">⚙</div>
-          <div className="w-7 h-7 rounded-full bg-blue-700 flex items-center justify-center font-bold text-white text-xs cursor-pointer">
-            {(player.username[0]??"T").toUpperCase()}
-          </div>
-        </nav>
-      </header>
-
-      <div className="flex flex-1 overflow-hidden">
-        {/* ── sidebar ── */}
-        <aside className="w-52 shrink-0 border-r border-[#1e2d45] flex flex-col p-4 gap-3 overflow-y-auto bg-[#0d1117]">
-          {/* avatar */}
-          <div className="flex flex-col items-center gap-2 pb-3 border-b border-[#1e2d45]">
-            <div className="w-14 h-14 rounded-full bg-blue-900/50 border-2 border-blue-700 flex items-center justify-center font-black text-blue-300 text-2xl"
-                 style={{boxShadow:"0 0 12px rgba(59,130,246,.25)"}}>
-              {(player.username[0]??"T").toUpperCase()}
-            </div>
-            <div className="text-center">
-              <p className="text-[#e2e8f0] font-bold text-sm">{player.username}</p>
-              <span className="badge text-[9px] py-0 mt-0.5 inline-block">LEVEL {player.level} OPERATIVE</span>
-            </div>
-            <div className="w-full hp-bar-wrap"><div className="xp-bar-fill" style={{width:xpPct+"%"}}/></div>
-          </div>
-
-          {/* nav */}
-          <nav className="flex flex-col gap-1">
-            <p className="text-[9px] text-[#334155] uppercase tracking-widest px-3 pt-1 mb-0.5">Navigation</p>
-            {([
-              ["🗺 World Map","map"],
-              ["⚙ Player Stats","log"],
-              ["📋 Activity Log","leaderboard"],
-              ["🏆 Rankings","rankings"],
-              ["📜 Quests","quests"],
-              ["🎒 Inventory","inventory"],
-            ] as [string,typeof activeTab][]).map(([label,tab])=>(
-              <button key={tab} onClick={()=>setActiveTab(tab)} className={"sidebar-item"+(activeTab===tab?" active":"")}>
-                {label}
-              </button>
-            ))}
-            <div className="border-t border-[#1e2d45] my-1"/>
-            <button className="sidebar-item" disabled={busy} onClick={()=>dispatch("combat")}>⚔ Combat</button>
-          </nav>
-
-          {/* stats */}
-          <div className="mt-auto flex flex-col gap-2 pt-3 border-t border-[#1e2d45]">
-            <div className="flex items-center justify-between text-[10px] text-[#64748b] uppercase">
-              <span>HP</span><span className="text-[#e2e8f0] tabular-nums">{player.hp}/{player.max_hp}</span>
-            </div>
-            <div className="hp-bar-wrap"><div className="hp-bar-fill" style={{width:hpPct+"%",background:hpColor}}/></div>
-            <div className="grid grid-cols-2 gap-1.5 mt-1">
-              {([["ATK",player.attack],["DEF",player.defense],["GOLD",player.gold],["LVL",player.level]] as [string,number][]).map(([l,v])=>(
-                <div key={l} className="card-dark rounded px-2 py-1.5 text-center">
-                  <p className="text-[#e2e8f0] font-bold text-sm tabular-nums">{v}</p>
-                  <p className="text-[#475569] text-[9px] uppercase">{l}</p>
-                </div>
-              ))}
-            </div>
-            <div className="card-dark rounded-lg px-3 py-2">
-              <p className="text-[9px] text-[#475569] uppercase tracking-widest mb-0.5">Current Sector</p>
-              <p className="text-[#60a5fa] text-xs font-semibold">{location}</p>
-              <p className="text-[10px] text-[#334155] mt-0.5">{ROOM_COORDS[currentRoomId]??""}</p>
-            </div>
-            <button className="btn-os btn-ghost-os w-full text-xs py-2" onClick={()=>{setUsername(null);setGs(null);}}>← Logout</button>
-          </div>
-        </aside>
-
-        {/* ── main content ── */}
-        <main className="flex-1 overflow-y-auto p-5 flex flex-col gap-4 bg-[#0a0e1a]">
-          {activeTab==="map"&&<WorldMapSVG gs={gs} onTravel={dir=>dispatch("move",[dir])} busy={busy}/>}
-
-          {activeTab==="log"&&(
-            <>
-              <p className="text-[10px] text-[#64748b] uppercase tracking-widest shrink-0 flex items-center gap-2">
-                <span className="text-[#334155]">World</span><span className="text-[#1e2d45]">/</span><span className="text-[#60a5fa]">Player Stats</span>
-              </p>
-              <PlayerStatsView gs={gs} busy={busy}/>
-            </>
-          )}
-
-          {activeTab==="leaderboard"&&(
-            <>
-              <p className="text-[10px] text-[#64748b] uppercase tracking-widest shrink-0 flex items-center gap-2">
-                <span className="text-[#334155]">World</span><span className="text-[#1e2d45]">/</span><span className="text-[#60a5fa]">Activity Log</span>
-              </p>
-              <ActivityLogView gs={gs} dispatch={dispatch} busy={busy}/>
-            </>
-          )}
-
-          {activeTab==="rankings"&&(
-            <>
-              <p className="text-[10px] text-[#64748b] uppercase tracking-widest shrink-0 flex items-center gap-2">
-                <span className="text-[#334155]">World</span><span className="text-[#1e2d45]">/</span><span className="text-[#60a5fa]">Global Rankings</span>
-              </p>
-              <LeaderboardView gs={gs}/>
-            </>
-          )}
-
-          {activeTab==="quests"&&(
-            <>
-              <p className="text-[10px] text-[#64748b] uppercase tracking-widest shrink-0 flex items-center gap-2">
-                <span className="text-[#334155]">World</span><span className="text-[#1e2d45]">/</span><span className="text-[#60a5fa]">Quests &amp; Skills</span>
-              </p>
-              <QuestsView gs={gs} dispatch={dispatch} busy={busy}/>
-            </>
-          )}
-
-          {activeTab==="inventory"&&(
-            <>
-              <p className="text-[10px] text-[#64748b] uppercase tracking-widest shrink-0 flex items-center gap-2">
-                <span className="text-[#334155]">World</span><span className="text-[#1e2d45]">/</span><span className="text-[#60a5fa]">Inventory &amp; Shop</span>
-              </p>
-              <InventoryView gs={gs} dispatch={dispatch} busy={busy}/>
-            </>
-          )}
-
-          {/* system status log */}
-          {gs.events.length>0&&(
-            <div ref={logRef} className="card-dark rounded-lg p-4 shrink-0 space-y-1 overflow-y-auto" style={{maxHeight:90}}>
-              <p className="text-[9px] text-[#475569] uppercase tracking-widest mb-2">System Log</p>
-              {gs.events.map((ev,i)=>{
-                const _i=i;void _i;const last=i===gs.events.length-1;
-                const cls=ev.startsWith("Victory")?"text-yellow-400":ev.includes("fallen")?"text-red-400":last?"text-[#93c5fd]":"text-[#475569]";
-                return<p key={i} className={"text-[11px] "+cls}><span className="text-[#2d3d55] mr-2">{String(i+1).padStart(2,"0")}.</span>{ev}</p>;
-              })}
-            </div>
-          )}
-        </main>
-      </div>
-
-      {/* ── footer ── */}
-      <footer className="flex items-center justify-between px-5 py-2 border-t border-[#1e2d45] text-[10px] text-[#334155] bg-[#0d1117] shrink-0">
-        <div className="flex items-center gap-4">
-          <span className="flex items-center gap-1.5"><span className="dot-green"/>Algorithm: Binary Search O(log n)</span>
-          <span className="hidden sm:flex items-center gap-1.5"><span className="dot-blue"/>Last Sorted: 12ms ago</span>
-        </div>
-        <div className="flex items-center gap-1.5"><span className="dot-green"/>Node Status: Healthy</div>
-      </footer>
-    </div>
-  );
+  return <LoginScreen onLogin={handleLogin} />;
 }
